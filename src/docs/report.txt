@@ -1,0 +1,167 @@
+XORVARIANCE / MVI AUTOCROPPER - FINDINGS
+========================================
+Data: 46 images in ./images (jpg/jpeg/webp/png/gif; RGB, RGBA, P, L and 1
+modes). Measured with the Python prototype at 256 px tiles, lo=1, hi=9,
+mode zero, minimum box 2x2. Every number in sections 1-4 was measured on this
+set. The prototype only explores behaviour. The C kernel in section 5 defines
+the metric, and nothing in it is shaped to match the prototype or any library.
+
+Purpose: split crowded multi-subject frames into crops for wdtagger, then take
+a weighted sum of tag overlap against the full-image pass. Dropping cloud and
+sky tiles is wanted.
+
+
+1. WHAT THE FOLD COMPUTES
+-------------------------
+Folding a tile with XOR gives the parity of each of its 8 bit-planes. The
+popcount is the number of bit-planes with an odd count of set bits.
+
+ a) Every flat tile with an even area folds to 0 (160 of 160 tiles here).
+
+ b) A tile in which every value occurs an even number of times also folds to
+    0, whatever it contains. In return.png a grain overlay repeats every
+    128 px, so 54 of 144 tiles cancel to 0 even though their ranges go up to
+    140. Wallpapers, dither patterns, transparency checkerboards and
+    duplicated sprites cancel the same way. airbaloons.png (mode 1, almost
+    entirely pixel-doubled) has 8 content tiles that fold to 0 for this
+    reason.
+
+ c) On all other tiles the popcount follows binomial(8, 1/2), measured on
+    1883 non-flat tiles:
+        popcount : 0     1     2     3     4     5     6     7     8
+        measured : .052  .028  .117  .221  .262  .187  .096  .030  .008
+        binomial : .004  .031  .109  .219  .273  .219  .109  .031  .004
+    Most of the excess at 0 is case (b). Popcounts 2-8 carry no ranking: the
+    only signal is whether the fold is 0 or not.
+
+ d) Popcount 1 never occurs on a flat tile. Every hit at 1 is a non-flat tile,
+    and they arrive at the binomial rate (2.8% measured, 3.1% expected).
+       lo=0 : only flat tiles and even-repeat tiles.
+       lo=1 : those, plus about 3% of all other tiles, picked without regard
+              to content.
+    The 309 violations at 256 px break down as 160 flat, 32 near-flat
+    (range <= 16) and 117 textured.
+
+ e) For crowded frames this matters because a lo=1 hit lands on a person as
+    easily as on sky. In "Screenshot 2026-04-16 170916.png", tiles (1,3),
+    (2,3) and (2,4) are the girl's head, arm and torso (ranges 234, 219, 220),
+    and that is what split her. In hotcrap.png the hits are the cloud, the
+    middle balloon and sky, all of them textured tiles. With lo=0, flat and
+    repeating backgrounds still act as separators and the hits on subjects go
+    away.
+
+ f) Shifting the tile grid by 1 px kept 247 of 309 violations, including all
+    160 flat ones. The hits that move are the textured ones.
+
+
+2. INPUTS AND DETERMINISM
+-------------------------
+ - Parity flips on any change of 1 LSB. Flat and repeating tiles are stable
+   across decoders. Textured tiles are tied to whichever decoder produces the
+   bytes, so fix one decoder for the archive and the results are
+   reproducible.
+ - Fold the gray plane, and get it with the cheapest route for each source
+   (see section 5). The choice of luma weights does not change what the
+   metric detects: a flat tile is flat under any weighting, and so is a
+   repeat.
+ - XOR does not commute with weighted channel mixing. Fold after the gray
+   reduction, or fold the raw interleaved bytes and skip gray altogether.
+   The second option is a separate, equally valid metric: a flat tile still
+   gives 0, and parity is taken over all channel bytes together.
+
+
+3. EDGE AND ALPHA CASES
+-----------------------
+ - 430 of 2043 tiles were partial edge tiles. A flat tile with an odd area
+   folds to its pixel value instead of 0 (2 cases in this set). Fix: if the
+   area is odd, XOR the result with the first pixel. That is one scalar op
+   per affected tile.
+ - Narrow slivers (for example 256x5) go through the same test with very few
+   pixels in them.
+ - The prototype discards alpha. One RGBA image here had any alpha below
+   255, and none had fully transparent pixels. In the archive, the RGB under
+   alpha=0 is whatever the exporter left there. If transparency should count
+   as background, fold the alpha bytes in, or force alpha=0 pixels to a
+   constant with a vpcmpeqb/vpblendvb pair before folding.
+
+
+4. SELECTOR FINDINGS
+--------------------
+ - 14 of 46 images have no violations at 256 px. Their only MVI is the whole
+   image, which duplicates the full-image pass, so skip them before the
+   selector and the tagger.
+ - Mode dontcare with no box maximum always returns the whole image, so it
+   needs --max-width and --max-height to be useful.
+ - MVIs overlap. Tag weights based on area count shared tiles twice. Weight
+   per tile instead: each tile casts one vote, split across the MVIs that
+   cover it.
+ - With the 2x2 minimum, isolated content tiles are left uncovered (5 on
+   hotcrap.png). The full-image pass still sees them.
+ - Aspect ratio is unconstrained (a 2x8 box is 4:1) and wdtagger's input is
+   square. Add a maximum-aspect option if padded crops cause trouble.
+ - Tile size sets how finely subjects separate. On the screenshot, 128 px
+   with lo=1 gives 11 MVIs, against 4 at 256 px.
+
+
+5. C99 / AVX2 KERNEL (COMET LAKE: AVX2, BMI2, POPCNT, NO AVX-512)
+-----------------------------------------------------------------
+Everything stays 8-bit end to end: 32 pixels per ymm and one byte of result
+per tile.
+
+ Gray plane, by source:
+ - JPEG and lossy WebP: they are already YCbCr/YUV. Take the Y plane straight
+   from the decoder. That avoids colour conversion and chroma upsampling,
+   and costs nothing.
+ - Already-gray sources (L, palette resolved through a gray LUT, 1-bit
+   expanded): fold the plane directly.
+ - RGB/RGBA sources: gray = vpavgb(vpavgb(R, B), G), which is about
+   (R + 2G + B) / 4 in two byte ops per 32 pixels, with no multiplies and no
+   widening.
+ - Deinterleaving RGBA, 32 pixels at a time (4 loads): vpshufb each load into
+   per-lane [R0-3|G0-3|B0-3|A0-3], then vpunpck{l,h}dq and vpunpck{l,h}qdq
+   give 32 R, 32 G and 32 B bytes. No lane-crossing vpermq is needed,
+   because XOR does not care about pixel order. All channels end up with the
+   same permutation, and the fold cannot tell. For RGB24, ask the decoder
+   for RGBX output so it stays on this path, or fold the raw bytes (section 2)
+   and skip deinterleaving entirely.
+ - Raw-byte variant: one vpxor per 32 bytes. A 256 px RGB tile row is
+   768 bytes, which is 24 aligned ymm loads and never straddles a tile.
+
+ Fold:
+ - One ymm accumulator per tile column for the current tile row. Up to
+   16 columns stay in registers. Above that, the accumulators sit in a small
+   aligned array.
+ - Single pass: consume rows as the decoder emits them and vpxor each 32-byte
+   chunk into its column's accumulator. Pixels are read once and never
+   revisited, and prefetchnta keeps them out of the way. The tile bytes go to
+   the GPU staging buffer without the fold ever touching them again.
+ - Horizontal reduction of many tiles at once: when a tile row finishes, do
+   not fold each accumulator to a scalar separately. Combine accumulators in
+   pairs with vpunpck{l,h}* and vpxor, a butterfly that halves the bytes per
+   tile at each level, until one ymm holds one byte per tile (32 tiles per
+   register).
+ - Popcount 32 tiles in parallel: a vpshufb nibble LUT on the low and high
+   nibbles, then vpaddb.
+ - Threshold: vpcmpgtb against the broadcast lo and hi values, then
+   vpmovmskb. The violation mask for a whole tile row lands in one 32-bit GPR.
+   With lo=0 this is simply vpcmpeqb against zero followed by vpmovmskb, and
+   the popcount step disappears.
+
+ Several tile sizes from one pass:
+ - XOR is associative. Fold at the finest tile size (32 or 64 px), keep the
+   per-tile bytes, and every coarser size is the XOR of its child tiles. That
+   is a vpxor between adjacent rows of tile bytes, plus a byte-pair fold
+   across columns. Changing tile size never touches pixels again.
+
+ Selector on bitmasks:
+ - Each tile row is a uint32 or uint64 mask. Runs of allowed tiles of width
+   at least w are m & (m >> 1) & ... & (m >> (w - 1)), which takes log2(w)
+   steps by doubling the shift. AND the row masks together for vertical
+   extent. tzcnt/lzcnt find run edges and pext/pdep pull out runs.
+ - Prime rectangles: grow a candidate downward by ANDing row masks, and stop
+   when the run set shrinks. A rectangle is maximal when its row band is
+   bounded on both sides and its run is bounded left and right.
+ - Cover: rectangle cover sets are bitmasks over the grid, so set-cover
+   branch-and-bound uses AND/ANDN/popcnt on a few machine words per set.
+   The grid is tiny compared with the pixel data, and all of it fits in
+   registers or L1.

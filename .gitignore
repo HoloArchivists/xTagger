@@ -1,0 +1,6 @@
+/images/
+/build/
+# weights are converted locally (README: Converting the models), not shipped
+/src/models/*.bin
+/src/models/*.bin.tags
+/src/models/calib/
