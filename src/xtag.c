@@ -395,7 +395,10 @@ int main(int argc, char **argv)
     fprintf(stderr, "prof host waiting for decode  %9.1f ms (%u images)\n", dwait, npaths);
 #endif
     WaitForMultipleObjects(nth, th, TRUE, INFINITE);
+    for (i = 0; i < nth; i++) CloseHandle(th[i]);
     pi_close(&tagger);
+    for (i = 0; i < npaths; i++) free(paths[i]);
+    free(paths);
     if (stats) {
         QueryPerformanceCounter(&q1);
         QueryPerformanceFrequency(&qf);
