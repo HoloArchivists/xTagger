@@ -6,15 +6,16 @@
 // (cold device wake, context, weights, graph) runs on its own thread while the host already prepares batches into
 // the buffers, which are page-locked in place once the context exists. eva_ready / eva_poll join it.
 //
-// Block GEMMs (QKV, out-proj, fc1, fc2): E4M3 x E4M3 on cuBLASLt, fp32 accumulate, per-tensor static scales from
-// eva02.bin v3 (smoothing folded in by export_eva.py). Patch embed and head: fp16 cuBLAS.
+// Block GEMMs (QKV, out-proj, fc1, fc2): E4M3 x E4M3 on gemm8 (kern_common.cuh), fp32 accumulate, per-tensor static
+// scales from eva02.bin v3 (smoothing folded in by export_eva.py). Patch embed: fp16 on the same pipeline (k_pe);
+// head: batched GEMV with the sigmoid fused (k_headmv). No cuBLAS outside the calibration build.
 // -DEVA_CALIB builds the fp16 reference engine (eva02.bin v2) that records per-channel |max| of every block GEMM
 // input and writes <weights>.calib on close, which export_eva.py turns into v3.
 //
 // Input per model input: the patch GEMM operand itself, fp16 [1024 patches][592] (c * 196 + ky * 14 + kx, BGR,
 // normalised to [-1, 1], columns 588..591 zero) - procimg writes it straight from the resize.
 //
-//   eva_open(e, "eva02.bin", device, pool, bytes)  ->  eva_submit(e, s, inputs, n)  ->  eva_wait(e, s)
+//   eva_open(e, "eva02.bin", device, pool, bytes, extra)  ->  eva_submit(e, s, inputs, n)  ->  eva_wait(e, s)
 // Inputs live in the caller's pool (page-locked in place by the bring-up thread) and are DMA'd from there: the host
 // writes each model input exactly once, with streaming stores, and never copies it.
 
@@ -25,9 +26,10 @@
 #include <string.h>
 #include <windows.h>
 #include <cuda.h>
+// cuBLAS only in the fp16 calibration engines; the shipped FP8 engines run every GEMM on their own kernels, so the
+// production binary neither imports nor initialises it
+#if defined(EVA_CALIB) || defined(PX_CALIB)
 #include <cublas_v2.h>
-#ifndef EVA_CALIB
-#include <cublasLt.h>
 #endif
 
 #ifndef EVA_CUBIN
@@ -55,14 +57,16 @@
 #define EVA_IN    ((size_t)EVA_NP * EVA_K0P)          // halves per model input
 #define EVA_M     ((EVA_NB * EVA_T + 15) & ~15)       // token rows, padded to 16
 #define EVA_CHUNK (32u << 20)                         // weight streaming chunk
-#define EVA_WS    (32u << 20)                         // cuBLAS workspace
+#define EVA_WS    (32u << 20)                         // cuBLAS workspace (calibration builds)
 #define EVA_WB    (EVA_VER == 3 ? 1 : 2)              // bytes per block-GEMM weight
 #define EVA_NG    4                                   // block GEMMs: QKV, O, W12, W2
 #define EVA_NS    12                                  // v3 scale table row: wdq x4, adq x4, q, k, v, pad
 #define EVA_TP    1088                                // attention keys padded to EVA_NKT * 64
+#define EVA_NCT   (2 * EVA_HIDP / 96)                 // fc1 column tiles
 #define EVA_CALN  ((size_t)EVA_NL * (EVA_NG * EVA_HIDP + 3 * EVA_D + EVA_HIDP)) // calibration floats
 #define EVA_RT    CUDA_R_16F                          // residual stream type
 #define EVA_RB    2
+#define EVA_HB_OFF 0xC1800000u                        // -16.0f: bias of an extra head row nothing has written
 
 #ifdef EVA_PROF
 // Probe (gated, zero footprint otherwise): QPC phase marks, per-op GPU event timing of one direct forward, and the
@@ -105,12 +109,9 @@ typedef struct {
 typedef struct {
     CUdeviceptr ln1w, ln1b, wqkv, wo, ln2w, ln2b, w12, mlnw, mlnb, w2;
     CUdeviceptr rs, cn, dn;                           // v3: h quant multipliers, folded MLP-LN terms
-#ifndef EVA_CALIB
-    CUdeviceptr sw[EVA_NG], sa[EVA_NG];               // device: weight / activation dequant scales
-    cublasLtMatmulDesc_t desc[EVA_NG];
-#endif
     float qs[EVA_NG];                                 // host: activation quant multipliers (448 / amax)
-    float cq, ck, cv, sinv, vo, a0, a12, a3;          // a0 / a12 / a3: qkv / fc1 / fc2 dequant (weight x act)                           // host: attention E4M3 multipliers, score / output scales
+    float cq, ck, cv, sinv, vo;                       // attention E4M3 multipliers, score / output scales
+    float a0, a1, a12, a3;                            // qkv / out-proj / fc1 / fc2 dequant (weight x activation)
 } eva_layer;
 
 typedef struct {
@@ -119,15 +120,13 @@ typedef struct {
     CUstream st;
     CUmodule mod;
     CUfunction f_embed, f_ln, f_lnh, f_prep, f_flash, f_qkv, f_fc1, f_fc2, f_swiglu, f_pool, f_head, f_amax;
-    cublasHandle_t cb;
+    CUfunction f_pe, f_oproj, f_headmv;
 #ifdef EVA_CALIB
+    cublasHandle_t cb;
     CUdeviceptr amax;                                 // [EVA_NL][EVA_NG][EVA_HIDP] + [EVA_NL][3 * EVA_D] float bits
-#else
-    cublasLtHandle_t lt;
-    cublasLtMatrixLayout_t la[EVA_NG], lb[EVA_NG], lc[EVA_NG];
-    cublasLtMatmulAlgo_t algo[EVA_NG];
 #endif
     CUdeviceptr wts, scl, pe, pos, cs, fnw, fnb, hw, hb;
+    CUdeviceptr hw0, hb0;                             // head inside the blob; hw / hb are a copy with extra rows
     eva_layer L[EVA_NL];
     CUdeviceptr in, x, h, u, m, q8, k8, v8, stat, hc, pool, pn, logit, out, ws;
     CUgraphExec graph;
@@ -135,13 +134,14 @@ typedef struct {
     void *ipool;                                      // caller's input pool, page-locked at bring-up
     size_t ipoolb;
     float *hout[EVA_NBUF];
+    uint16_t *hpn[EVA_NBUF];                          // with extra rows: the head inputs (pooled, normed) per batch
     HANDLE boot;                                      // bring-up thread until joined
     float sclh[EVA_NL * EVA_NS];                      // v3 scale table (host copy)
     int devno, bstatus, up;
     const char *path;
     size_t wbytes;
-    uint32_t nt, ntp;
-    eva_ws wsj;                                       // weight streaming job
+    uint32_t nt, ntp, nt0;                            // nt = nt0 tags of the file + extra head rows (tag stealing)
+    eva_ws wsj;                                      // weight streaming job
 #ifdef EVA_PROF
     CUevent pev[256];
     uint8_t pid[256];
@@ -182,6 +182,7 @@ static inline int eva_cb_ck(int s, const char *what)
         (off) += (bytes);                                                               \
     } while (0)
 #define EVA_F32(p, n) ((p) + (size_t)(n) * 4)
+#ifdef EVA_CALIB
 // Row-major Y[rows][n] (op)= X[rows][k] * W[n][k]^T as a column-major TN fp16 GEMM.
 #define EVA_LIN(e, W, X, n, k, rows, beta, Y, ct)                                       \
     do {                                                                                \
@@ -205,13 +206,11 @@ static inline int eva_gemm(eva *e, int m, int n, int k, CUdeviceptr A, int lda, 
     return 0;
 }
 
-// Block GEMM of layer i, kind g: Y[EVA_M][n] (op)= X[EVA_M][k] * W[n][k]^T.
-// E4M3 through the layer's descriptor (scales bound in it) and the shape's chosen algorithm; the calibration build
-// runs it in fp16 and records X per column first.
+// Block GEMM of layer i, kind g in the calibration engine: Y[EVA_M][n] (op)= X[EVA_M][k] * W[n][k]^T in fp16, with
+// X recorded per column first.
 static inline int eva_blk(eva *e, uint32_t i, uint32_t g, CUdeviceptr W, CUdeviceptr X, int n, int k, float beta,
                           CUdeviceptr Y, cudaDataType ct)
 {
-#ifdef EVA_CALIB
     CUdeviceptr a;
     uint32_t kk, rows;
 
@@ -220,17 +219,9 @@ static inline int eva_blk(eva *e, uint32_t i, uint32_t g, CUdeviceptr W, CUdevic
     a = e->amax + ((size_t)i * EVA_NG + g) * EVA_HIDP * 4;
     EVA_LAUNCH(e, f_amax, (kk / 8 + 127) / 128, 64, 128, &X, &kk, &rows, &a);
     EVA_LIN(e, W, X, n, k, EVA_M, beta, Y, ct);
-#else
-    float one;
-
-    (void)n; (void)k; (void)ct;
-    one = 1.0f;
-    EVA_CB(cublasLtMatmul(e->lt, e->L[i].desc[g], &one, (const void *)W, e->la[g], (const void *)X, e->lb[g], &beta,
-                          (void *)Y, e->lc[g], (void *)Y, e->lc[g], &e->algo[g], (void *)e->ws, EVA_WS,
-                          (cudaStream_t)e->st));
-#endif
     return 0;
 }
+#endif
 
 // The whole forward pass for EVA_NB inputs on e->st (captured once into e->graph).
 static inline int eva_forward(eva *e)
@@ -244,17 +235,22 @@ static inline int eva_forward(eva *e)
     kq = 3 * EVA_D;
     kh = EVA_HIDP;
 #else
-    uint32_t rows;
+    uint32_t rows, prows;
 
     rows = EVA_NB * EVA_T;
+    prows = EVA_NB * EVA_NP;
 #endif
 
     M = EVA_M;
     lnb = M >> 3;
     nb = EVA_NB;
     total = EVA_NB * e->nt;
+#ifdef EVA_CALIB
     if (eva_gemm(e, EVA_D, EVA_NP, EVA_K0P, e->pe, EVA_K0P, 0, e->in, EVA_K0P, (long long)EVA_IN, 0.0f,
                  e->x + (size_t)EVA_D * EVA_RB, EVA_RT, EVA_D, (long long)EVA_T * EVA_D, EVA_NB)) return -1;
+#else
+    EVA_LAUNCH(e, f_pe, EVA_D / 128, prows / 128, 128, &e->in, &e->pe, &e->x, &prows);
+#endif
     EVA_LAUNCH(e, f_embed, EVA_NB * EVA_T, 1, 256, &e->x, &e->pos);
     EVA_PT(e, 0);
     for (i = 0; i < EVA_NL; i++) {
@@ -287,11 +283,10 @@ static inline int eva_forward(eva *e)
         EVA_PT(e, 2);
         EVA_LAUNCH3(e, f_flash, EVA_NKT, EVA_NH, EVA_NB, 128, &e->q8, &e->k8, &e->v8, &e->h, &L->sinv, &L->vo);
         EVA_PT(e, 4);
-        EVA_BLK(e, i, 1, L->wo, e->h, EVA_D, EVA_D, 1.0f, e->x, EVA_RT);
+        EVA_LAUNCH(e, f_oproj, EVA_D / 128, (rows + 127) / 128, 128, &e->h, &L->wo, &e->x, &L->a1, &rows);
         EVA_PT(e, 5);
         EVA_LAUNCH(e, f_ln, lnb, 1, 256, &e->x, &L->ln2w, &L->ln2b, &e->h, &M, &L->qs[2]);
         EVA_PT(e, 6);
-        EVA_CU(cuMemsetD32Async(e->stat, 0, (size_t)M * 2, e->st));
         EVA_PT(e, 3);
         EVA_LAUNCH(e, f_fc1, (M + 127) / 128, 2 * EVA_HIDP / 96, 128, &e->h, &L->w12, &e->m, &e->stat, &L->rs, &L->a12,
                    &M);
@@ -303,8 +298,13 @@ static inline int eva_forward(eva *e)
     }
     EVA_LAUNCH(e, f_pool, EVA_NB, 16, 256, &e->x, &e->pool);
     EVA_LAUNCH(e, f_lnh, (EVA_NB + 7) >> 3, 1, 256, &e->pool, &e->fnw, &e->fnb, &e->pn, &nb);
+#ifdef EVA_CALIB
     EVA_LIN(e, e->hw, e->pn, e->ntp, EVA_D, EVA_NB, 0.0f, e->logit, CUDA_R_32F);
     EVA_LAUNCH(e, f_head, (total + 255) >> 8, 1, 256, &e->logit, &e->hb, &e->out, &e->nt, &e->ntp, &total);
+#else
+    (void)total;
+    EVA_LAUNCH(e, f_headmv, (e->nt + 63) / 64, 1, 256, &e->pn, &e->hw, &e->hb, &e->out, &e->nt, &nb);
+#endif
     EVA_PT(e, 10);
     return 0;
 }
@@ -405,13 +405,7 @@ static inline int eva_layout(eva *e, const float *scl)
             EVA_TAKE(e, off, e->L[i].mlnb, EVA_HIDP * 4);
             EVA_TAKE(e, off, e->L[i].w2, (size_t)EVA_D * EVA_HIDP * EVA_WB);
         }
-        for (g = 0; g < EVA_NG; g++) {
-            e->L[i].qs[g] = scl ? 1.0f / scl[i * EVA_NS + EVA_NG + g] : 1.0f;
-#ifndef EVA_CALIB
-            e->L[i].sw[g] = e->scl + ((size_t)i * EVA_NS + g) * 4;
-            e->L[i].sa[g] = e->scl + ((size_t)i * EVA_NS + EVA_NG + g) * 4;
-#endif
-        }
+        for (g = 0; g < EVA_NG; g++) e->L[i].qs[g] = scl ? 1.0f / scl[i * EVA_NS + EVA_NG + g] : 1.0f;
         if (scl) {
             e->L[i].cq = 1.0f / scl[i * EVA_NS + 8];
             e->L[i].ck = 1.0f / scl[i * EVA_NS + 9];
@@ -419,6 +413,7 @@ static inline int eva_layout(eva *e, const float *scl)
             e->L[i].sinv = scl[i * EVA_NS + 8] * scl[i * EVA_NS + 9];
             e->L[i].vo = e->L[i].qs[1] * scl[i * EVA_NS + 10];
             e->L[i].a0 = scl[i * EVA_NS] * scl[i * EVA_NS + EVA_NG];
+            e->L[i].a1 = scl[i * EVA_NS + 1] * scl[i * EVA_NS + EVA_NG + 1];
             e->L[i].a12 = scl[i * EVA_NS + 2] * scl[i * EVA_NS + EVA_NG + 2];
             e->L[i].a3 = scl[i * EVA_NS + 3] * scl[i * EVA_NS + EVA_NG + 3];
         }
@@ -433,54 +428,6 @@ static inline int eva_layout(eva *e, const float *scl)
     }
     return 0;
 }
-
-#ifndef EVA_CALIB
-// Shared layouts and one heuristic algorithm per block-GEMM shape; one descriptor per layer and GEMM (it carries
-// that layer's scale pointers).
-static inline int eva_lt_init(eva *e)
-{
-    static const int gn[EVA_NG] = {3 * EVA_D, EVA_D, 2 * EVA_HIDP, EVA_D};
-    static const int gk[EVA_NG] = {EVA_D, EVA_D, EVA_D, EVA_HIDP};
-    static const cudaDataType gt[EVA_NG] = {CUDA_R_16F, EVA_RT, CUDA_R_16F, EVA_RT};
-    cublasLtMatmulPreference_t pref;
-    cublasLtMatmulHeuristicResult_t res;
-    cublasOperation_t opt, opn;
-    size_t ws;
-    void *p;
-    uint32_t i, g;
-    int nres;
-
-    opt = CUBLAS_OP_T;
-    opn = CUBLAS_OP_N;
-    ws = EVA_WS;
-    EVA_CB(cublasLtCreate(&e->lt));
-    EVA_CB(cublasLtMatmulPreferenceCreate(&pref));
-    EVA_CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
-    for (g = 1; g < 2; g++) { // out-proj only: QKV, fc1, fc2 run on k_qkv / k_fc1 / k_fc2
-        EVA_CB(cublasLtMatrixLayoutCreate(&e->la[g], CUDA_R_8F_E4M3, gk[g], gn[g], gk[g]));
-        EVA_CB(cublasLtMatrixLayoutCreate(&e->lb[g], CUDA_R_8F_E4M3, gk[g], EVA_M, gk[g]));
-        EVA_CB(cublasLtMatrixLayoutCreate(&e->lc[g], gt[g], gn[g], EVA_M, gn[g]));
-        for (i = 0; i < EVA_NL; i++) {
-            EVA_CB(cublasLtMatmulDescCreate(&e->L[i].desc[g], CUBLAS_COMPUTE_32F, CUDA_R_32F));
-            EVA_CB(cublasLtMatmulDescSetAttribute(e->L[i].desc[g], CUBLASLT_MATMUL_DESC_TRANSA, &opt, sizeof(opt)));
-            EVA_CB(cublasLtMatmulDescSetAttribute(e->L[i].desc[g], CUBLASLT_MATMUL_DESC_TRANSB, &opn, sizeof(opn)));
-            p = (void *)e->L[i].sw[g];
-            EVA_CB(cublasLtMatmulDescSetAttribute(e->L[i].desc[g], CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &p, sizeof(p)));
-            p = (void *)e->L[i].sa[g];
-            EVA_CB(cublasLtMatmulDescSetAttribute(e->L[i].desc[g], CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &p, sizeof(p)));
-        }
-        EVA_CB(cublasLtMatmulAlgoGetHeuristic(e->lt, e->L[0].desc[g], e->la[g], e->lb[g], e->lc[g], e->lc[g], pref, 1,
-                                              &res, &nres));
-        if (nres < 1) {
-            fprintf(stderr, "eva: no FP8 GEMM algorithm for shape %d x %d x %d\n", gn[g], EVA_M, gk[g]);
-            return -1;
-        }
-        e->algo[g] = res.algo;
-    }
-    cublasLtMatmulPreferenceDestroy(pref);
-    return 0;
-}
-#endif
 
 // CUDA bring-up, on the boot thread: device wake, context, weight streaming, kernels, buffers, graph, and the host
 // buffers page-locked in place.
@@ -518,11 +465,20 @@ static inline int eva_up(eva *e)
     EVA_CU(cuModuleGetFunction(&e->f_qkv, e->mod, "k_qkv"));
     EVA_CU(cuModuleGetFunction(&e->f_fc1, e->mod, "k_fc1"));
     EVA_CU(cuModuleGetFunction(&e->f_fc2, e->mod, "k_fc2"));
+    EVA_CU(cuModuleGetFunction(&e->f_pe, e->mod, "k_pe"));
+    EVA_CU(cuModuleGetFunction(&e->f_oproj, e->mod, "k_oproj"));
+    EVA_CU(cuModuleGetFunction(&e->f_headmv, e->mod, "k_headmv"));
 #endif
     EVA_CU(cuModuleGetFunction(&e->f_pool, e->mod, "k_pool"));
     EVA_CU(cuModuleGetFunction(&e->f_head, e->mod, "k_head"));
     EVA_CU(cuModuleGetFunction(&e->f_amax, e->mod, "k_amax"));
     if (eva_layout(e, EVA_VER == 3 ? e->sclh : NULL)) return -1;
+    if (e->nt > e->nt0) { // extra head rows: the forward reads a copy of the head, filled once the blob is resident
+        e->hw0 = e->hw;
+        e->hb0 = e->hb;
+        EVA_CU(cuMemAlloc(&e->hw, (size_t)e->nt * EVA_D * 2));
+        EVA_CU(cuMemAlloc(&e->hb, (size_t)e->nt * 4));
+    }
 #ifdef EVA_PROF
     EVA_TMARK(q, "module load");
 #endif
@@ -542,16 +498,16 @@ static inline int eva_up(eva *e)
     EVA_CU(cuMemsetD8(e->q8, 0, (size_t)EVA_NB * EVA_NH * EVA_TP * 64));
     EVA_CU(cuMemsetD8(e->k8, 0, (size_t)EVA_NB * EVA_NH * EVA_TP * 64));
     EVA_CU(cuMemsetD8(e->v8, 0, (size_t)EVA_NB * EVA_NH * EVA_TP * 64));
-    EVA_CU(cuMemAlloc(&e->stat, (size_t)EVA_M * 2 * 4));
+    EVA_CU(cuMemAlloc(&e->stat, (size_t)EVA_NCT * EVA_M * 2 * 4)); // fc1 row-sum partials, one slot per column tile
 #endif
     EVA_CU(cuMemAlloc(&e->pool, (size_t)EVA_NB * EVA_D * 4));
     EVA_CU(cuMemAlloc(&e->pn, (size_t)EVA_NB * EVA_D * 2));
-    EVA_CU(cuMemAlloc(&e->logit, (size_t)EVA_NB * e->ntp * 4));
     EVA_CU(cuMemAlloc(&e->out, (size_t)EVA_NB * e->nt * 4));
-    EVA_CU(cuMemAlloc(&e->ws, EVA_WS));
     EVA_CU(cuMemsetD8(e->x, 0, (size_t)EVA_M * EVA_D * EVA_RB)); // padding rows stay finite
     EVA_CU(cuMemsetD8(e->h, 0, (size_t)EVA_M * EVA_D * 2)); // flash never writes the padding rows
 #ifdef EVA_CALIB
+    EVA_CU(cuMemAlloc(&e->logit, (size_t)EVA_NB * e->ntp * 4));
+    EVA_CU(cuMemAlloc(&e->ws, EVA_WS));
     EVA_CU(cuMemAlloc(&e->amax, EVA_CALN * 4));
     EVA_CU(cuMemsetD8(e->amax, 0, EVA_CALN * 4));
 #endif
@@ -560,18 +516,17 @@ static inline int eva_up(eva *e)
 #endif
     for (s = 0; s < EVA_NBUF; s++) {
         EVA_CU(cuMemHostRegister(e->hout[s], ((size_t)EVA_NB * e->nt * 4 + 4095) & ~(size_t)4095, 0));
+        if (e->hpn[s]) EVA_CU(cuMemHostRegister(e->hpn[s], (size_t)EVA_NB * EVA_D * 2, 0));
         EVA_CU(cuEventCreate(&e->done[s], CU_EVENT_DISABLE_TIMING | CU_EVENT_BLOCKING_SYNC)); // waits sleep, not spin
     }
     EVA_CU(cuMemHostRegister(e->ipool, e->ipoolb, 0));
-
+#ifdef EVA_CALIB
     EVA_CB(cublasCreate(&e->cb));
     EVA_CB(cublasSetStream(e->cb, (cudaStream_t)e->st));
     EVA_CB(cublasSetWorkspace(e->cb, (void *)e->ws, EVA_WS));
-#ifdef EVA_PROF
-    EVA_TMARK(q, "pinned + cublasCreate");
 #endif
-#ifndef EVA_CALIB
-    if (eva_lt_init(e)) return -1;
+#ifdef EVA_PROF
+    EVA_TMARK(q, "pinned host buffers");
 #endif
     EVA_CU(cuStreamBeginCapture(e->st, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
     if (eva_forward(e)) return -1;
@@ -580,7 +535,7 @@ static inline int eva_up(eva *e)
     EVA_CU(cuGraphDestroy(g));
     EVA_CU(cuGraphUpload(e->graph, e->st));
 #ifdef EVA_PROF
-    EVA_TMARK(q, "lt init + graph capture");
+    EVA_TMARK(q, "graph capture");
 #endif
 
     WaitForSingleObject(th, INFINITE);
@@ -588,6 +543,12 @@ static inline int eva_up(eva *e)
     if (e->wsj.status) {
         fprintf(stderr, "eva: cannot stream weights from %s\n", e->path);
         return -1;
+    }
+    if (e->hw0) { // the file's rows, then extra rows that never fire (zero weights, bias EVA_HB_OFF)
+        EVA_CU(cuMemcpyDtoDAsync(e->hw, e->hw0, (size_t)e->nt0 * EVA_D * 2, e->st));
+        EVA_CU(cuMemcpyDtoDAsync(e->hb, e->hb0, (size_t)e->nt0 * 4, e->st));
+        EVA_CU(cuMemsetD8Async(e->hw + (size_t)e->nt0 * EVA_D * 2, 0, (size_t)(e->nt - e->nt0) * EVA_D * 2, e->st));
+        EVA_CU(cuMemsetD32Async(e->hb + (size_t)e->nt0 * 4, EVA_HB_OFF, e->nt - e->nt0, e->st));
     }
     EVA_CU(cuStreamSynchronize(e->st));
 #ifdef EVA_PROF
@@ -607,8 +568,9 @@ static DWORD WINAPI eva_boot(void *arg)
     return 0;
 }
 
-// Header and host buffers now; the CUDA bring-up starts on its own thread.
-static inline int eva_open(eva *e, const char *weights, int device, void *pool, size_t poolb)
+// Header and host buffers now; the CUDA bring-up starts on its own thread. extra: head rows past the file's tags
+// (tag stealing: written later with eva_head_put); with extra rows each batch also brings back its head inputs.
+static inline int eva_open(eva *e, const char *weights, int device, void *pool, size_t poolb, uint32_t extra)
 {
     FILE *f;
     uint32_t hdr[4], s;
@@ -624,7 +586,8 @@ static inline int eva_open(eva *e, const char *weights, int device, void *pool, 
     }
     fclose(f);
     e->path = weights;
-    e->nt = hdr[2];
+    e->nt0 = hdr[2];
+    e->nt = hdr[2] + extra;
     e->ntp = (hdr[2] + 7) & ~7u;
     e->wbytes = hdr[3];
     e->devno = device;
@@ -633,6 +596,7 @@ static inline int eva_open(eva *e, const char *weights, int device, void *pool, 
     for (s = 0; s < EVA_NBUF; s++) {
         e->hout[s] = _mm_malloc(((size_t)EVA_NB * e->nt * 4 + 4095) & ~(size_t)4095, 4096);
         if (!e->hout[s]) return -1;
+        if (extra && !(e->hpn[s] = _mm_malloc((size_t)EVA_NB * EVA_D * 2, 4096))) return -1;
     }
     e->bstatus = -1;
     e->boot = CreateThread(NULL, 0, eva_boot, e, 0, NULL);
@@ -671,7 +635,26 @@ static inline int eva_submit(eva *e, uint32_t buf, uint16_t *const *in, uint32_t
     }
     EVA_CU(cuGraphLaunch(e->graph, e->st));
     EVA_CU(cuMemcpyDtoHAsync(e->hout[buf], e->out, (size_t)n * e->nt * 4, e->st));
+    if (e->hpn[buf]) EVA_CU(cuMemcpyDtoHAsync(e->hpn[buf], e->pn, (size_t)n * EVA_D * 2, e->st));
     EVA_CU(cuEventRecord(e->done[buf], e->st));
+    return 0;
+}
+
+// Head row j (fp16 weights, fp32 bias), stream-ordered: batches launched after this see it. w is pageable, so the
+// copy is staged before the call returns and w may be reused at once.
+static inline int eva_head_put(eva *e, uint32_t j, const uint16_t *w, float bias)
+{
+    EVA_CU(cuMemcpyHtoDAsync(e->hw + (size_t)j * EVA_D * 2, w, EVA_D * 2, e->st));
+    EVA_CU(cuMemcpyHtoDAsync(e->hb + (size_t)j * 4, &bias, 4, e->st));
+    return 0;
+}
+
+// The file's head (nt0 rows fp16, nt0 biases) to the host, blocking. Only rows no eva_head_put has touched are read.
+static inline int eva_head_get(eva *e, uint16_t *w, float *bias)
+{
+    if (eva_ready(e)) return -1;
+    EVA_CU(cuMemcpyDtoH(w, e->hw0 ? e->hw0 : e->hw, (size_t)e->nt0 * EVA_D * 2));
+    EVA_CU(cuMemcpyDtoH(bias, e->hb0 ? e->hb0 : e->hb, (size_t)e->nt0 * 4));
     return 0;
 }
 
@@ -736,29 +719,26 @@ static inline void eva_close(eva *e)
 #ifdef EVA_CALIB
     eva_calib_dump(e);
     cuMemFree(e->amax);
-#else
-    for (i = 0; i < EVA_NG; i++) {
-        if (e->la[i]) cublasLtMatrixLayoutDestroy(e->la[i]);
-        if (e->lb[i]) cublasLtMatrixLayoutDestroy(e->lb[i]);
-        if (e->lc[i]) cublasLtMatrixLayoutDestroy(e->lc[i]);
-    }
-    for (i = 0; i < EVA_NL * EVA_NG; i++)
-        if (e->L[i / EVA_NG].desc[i % EVA_NG]) cublasLtMatmulDescDestroy(e->L[i / EVA_NG].desc[i % EVA_NG]);
-    if (e->lt) cublasLtDestroy(e->lt);
+    if (e->cb) cublasDestroy(e->cb);
 #endif
     if (e->graph) cuGraphExecDestroy(e->graph);
-    if (e->cb) cublasDestroy(e->cb);
     for (i = 0; i < EVA_NBUF; i++) {
         if (e->done[i]) {
             cuEventDestroy(e->done[i]);
             cuMemHostUnregister(e->hout[i]);
+            if (e->hpn[i]) cuMemHostUnregister(e->hpn[i]);
         }
         _mm_free(e->hout[i]);
+        _mm_free(e->hpn[i]);
     }
     if (e->done[0]) cuMemHostUnregister(e->ipool);
     cuMemFree(e->in); cuMemFree(e->x); cuMemFree(e->h); cuMemFree(e->u); cuMemFree(e->m); cuMemFree(e->q8); cuMemFree(e->k8); cuMemFree(e->v8);
     cuMemFree(e->stat); cuMemFree(e->hc);
-    cuMemFree(e->pool); cuMemFree(e->pn); cuMemFree(e->logit); cuMemFree(e->out); cuMemFree(e->ws); cuMemFree(e->wts);
+    cuMemFree(e->pool); cuMemFree(e->pn); cuMemFree(e->out); cuMemFree(e->wts);
+    if (e->hw0) { cuMemFree(e->hw); cuMemFree(e->hb); }
+#ifdef EVA_CALIB
+    cuMemFree(e->logit); cuMemFree(e->ws);
+#endif
     if (e->mod) cuModuleUnload(e->mod);
     if (e->st) cuStreamDestroy(e->st);
     cuDevicePrimaryCtxRelease(e->dev);

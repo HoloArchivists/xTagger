@@ -27,6 +27,7 @@
 #endif
 #define PX_NBUF   4
 #define PX_T      5184
+#define PX_NCH    (PX_T / 144)                        // attention-pool token chunks (k_phpool's PCH)
 #define PX_LW     576
 #define PX_HID    4736
 #define PX_NL     32
@@ -59,7 +60,10 @@ typedef struct {
     CUmodule mod;
     CUfunction f_embed, f_ln, f_qkv, f_flw, f_flg, f_proj, f_fc1, f_fc2, f_prep, f_addb, f_gelu, f_amax;
     CUfunction f_hln, f_hscore, f_hsoft, f_hv, f_head;
+    CUfunction f_pe, f_hpool, f_headmv;
+#ifdef PX_CALIB
     cublasHandle_t cb;
+#endif
     CUdeviceptr wts, pe, pos, lnpw, lnpb, csw, csg, hnw, hnb, U, hpos, wv, hw, hb;
     px_layer L[PX_NL];
     CUdeviceptr in, x, h, q8, k8, v8, u, y, s, P, pooled, o, logit, out, ws;
@@ -80,6 +84,7 @@ typedef struct {
     int devno, bstatus, up;
 } px;
 
+#ifdef PX_CALIB
 // C = A^T B with fp16 A, B and fp32 accumulate (column-major cuBLAS view of row-major Y[rows][n] = X[rows][k] W[n][k]^T).
 static inline int px_lin(px *p, CUdeviceptr W, CUdeviceptr X, int n, int k, int rows, float beta, CUdeviceptr Y,
                          cudaDataType ct)
@@ -92,7 +97,6 @@ static inline int px_lin(px *p, CUdeviceptr W, CUdeviceptr X, int n, int k, int 
     return 0;
 }
 
-#ifdef PX_CALIB
 // per-column |max| of X [PX_M][k] fp16 into calibration slot a
 #define PX_AMAX(p, X, kk, a)                                                            \
     do {                                                                                \
@@ -107,21 +111,24 @@ static inline int px_forward(px *p)
 {
     px_layer *L;
     CUdeviceptr cs, pv;
-    uint32_t rows, lnb, total, nb, i, L1, glob;
-    float one, beta, zero;
+    uint32_t rows, lnb, total, nb, i, L1, glob, nch;
 #ifdef PX_CALIB
     CUdeviceptr av;
     uint32_t k32;
-    float sthr;
+    float sthr, one, beta, zero;
 #endif
 
     rows = (uint32_t)PX_M;
     lnb = rows >> 3;
     nb = PX_NB;
     total = PX_NB * p->nt;
+#ifdef PX_CALIB
     one = 1.0f;
     zero = 0.0f;
     if (px_lin(p, p->pe, p->in, EVA_D, EVA_K0P, rows, 0.0f, p->x, EVA_RT)) return -1;
+#else
+    EVA_LAUNCH(p, f_pe, EVA_D / 128, rows / 128, 128, &p->in, &p->pe, &p->x, &rows);
+#endif
     EVA_LAUNCH(p, f_embed, lnb, 1, 256, &p->x, &p->pos, &p->lnpw, &p->lnpb, &rows);
     for (i = 0; i < PX_NL; i++) {
         L = &p->L[i];
@@ -165,15 +172,23 @@ static inline int px_forward(px *p)
     EVA_LAUNCH(p, f_hln, lnb, 1, 256, &p->x, &p->hnw, &p->hnb, &p->hpos, &p->y, &rows);
     EVA_LAUNCH(p, f_hscore, lnb, 1, 256, &p->y, &p->U, &p->s, &rows);
     EVA_LAUNCH(p, f_hsoft, PX_NB * 16, 1, 256, &p->s, &p->P);
+#ifdef PX_CALIB
     beta = 0.0f;
     EVA_CB(cublasGemmStridedBatchedEx(p->cb, CUBLAS_OP_N, CUBLAS_OP_N, EVA_D, 16, PX_T, &one, (const void *)p->y,
                                       CUDA_R_16F, EVA_D, (long long)PX_T * EVA_D, (const void *)p->P, CUDA_R_16F, PX_T,
                                       (long long)16 * PX_T, &beta, (void *)p->pooled, CUDA_R_32F, EVA_D,
                                       (long long)16 * EVA_D, PX_NB, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-    EVA_LAUNCH(p, f_hv, PX_NB * 16, 1, 256, &p->pooled, &p->wv, &p->o);
+    nch = 1;
+    EVA_LAUNCH(p, f_hv, PX_NB * 16, 1, 256, &p->pooled, &p->wv, &p->o, &nch);
     if (px_lin(p, p->hw, p->o, (int)p->ntp, EVA_D, PX_NB, zero, p->logit, CUDA_R_32F)) return -1;
     EVA_LAUNCH(p, f_head, (total + 255) >> 8, 1, 256, &p->logit, &p->hb, &p->out, &p->nt, &p->ntp, &total);
-    (void)nb;
+#else
+    nch = PX_NCH; // chunk partials, summed in order by k_phv
+    EVA_LAUNCH(p, f_hpool, PX_NB, PX_NCH, 512, &p->P, &p->y, &p->pooled);
+    EVA_LAUNCH(p, f_hv, PX_NB * 16, 1, 256, &p->pooled, &p->wv, &p->o, &nch);
+    EVA_LAUNCH(p, f_headmv, (p->nt + 63) / 64, 1, 256, &p->o, &p->hw, &p->hb, &p->out, &p->nt, &nb);
+    (void)total;
+#endif
     return 0;
 }
 
@@ -267,6 +282,9 @@ static inline int px_up(px *p)
     EVA_CU(cuModuleGetFunction(&p->f_proj, p->mod, "k_pproj"));
     EVA_CU(cuModuleGetFunction(&p->f_fc1, p->mod, "k_pfc1"));
     EVA_CU(cuModuleGetFunction(&p->f_fc2, p->mod, "k_pfc2"));
+    EVA_CU(cuModuleGetFunction(&p->f_pe, p->mod, "k_ppe"));
+    EVA_CU(cuModuleGetFunction(&p->f_hpool, p->mod, "k_phpool"));
+    EVA_CU(cuModuleGetFunction(&p->f_headmv, p->mod, "k_headmv"));
 #endif
     EVA_CU(cuModuleGetFunction(&p->f_hln, p->mod, "k_phln"));
     EVA_CU(cuModuleGetFunction(&p->f_hscore, p->mod, "k_phscore"));
@@ -293,19 +311,23 @@ static inline int px_up(px *p)
 #endif
     EVA_CU(cuMemAlloc(&p->s, PX_M * 16 * 4));
     EVA_CU(cuMemAlloc(&p->P, (size_t)PX_NB * 16 * PX_T * 2));
-    EVA_CU(cuMemAlloc(&p->pooled, (size_t)PX_NB * 16 * EVA_D * 4));
+    EVA_CU(cuMemAlloc(&p->pooled, (size_t)PX_NB * PX_NCH * 16 * EVA_D * 4));
     EVA_CU(cuMemAlloc(&p->o, (size_t)PX_NB * EVA_D * 2));
-    EVA_CU(cuMemAlloc(&p->logit, (size_t)PX_NB * p->ntp * 4));
     EVA_CU(cuMemAlloc(&p->out, (size_t)PX_NB * p->nt * 4));
+#ifdef PX_CALIB
+    EVA_CU(cuMemAlloc(&p->logit, (size_t)PX_NB * p->ntp * 4));
     EVA_CU(cuMemAlloc(&p->ws, EVA_WS));
+#endif
     for (s = 0; s < PX_NBUF; s++) {
         EVA_CU(cuMemHostRegister(p->hout[s], ((size_t)PX_NB * p->nt * 4 + 4095) & ~(size_t)4095, 0));
         EVA_CU(cuEventCreate(&p->done[s], CU_EVENT_DISABLE_TIMING | CU_EVENT_BLOCKING_SYNC));
     }
     EVA_CU(cuMemHostRegister(p->ipool, p->ipoolb, 0));
+#ifdef PX_CALIB
     EVA_CB(cublasCreate(&p->cb));
     EVA_CB(cublasSetStream(p->cb, (cudaStream_t)p->st));
     EVA_CB(cublasSetWorkspace(p->cb, (void *)p->ws, EVA_WS));
+#endif
     EVA_CU(cuStreamBeginCapture(p->st, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
     if (px_forward(p)) return -1;
     EVA_CU(cuStreamEndCapture(p->st, &g));
@@ -445,7 +467,9 @@ static inline void px_close(px *p)
     if (!p->ctx) return;
     if (p->st) cuStreamSynchronize(p->st);
     if (p->graph) cuGraphExecDestroy(p->graph);
+#ifdef PX_CALIB
     if (p->cb) cublasDestroy(p->cb);
+#endif
     for (i = 0; i < PX_NBUF; i++) {
         if (p->done[i]) {
             cuEventDestroy(p->done[i]);
@@ -456,9 +480,10 @@ static inline void px_close(px *p)
     if (p->done[0]) cuMemHostUnregister(p->ipool);
     cuMemFree(p->in); cuMemFree(p->x); cuMemFree(p->h); cuMemFree(p->y); cuMemFree(p->u);
     cuMemFree(p->q8); cuMemFree(p->k8); cuMemFree(p->v8);
-    cuMemFree(p->s); cuMemFree(p->P); cuMemFree(p->pooled); cuMemFree(p->o); cuMemFree(p->logit);
-    cuMemFree(p->out); cuMemFree(p->ws); cuMemFree(p->wts);
+    cuMemFree(p->s); cuMemFree(p->P); cuMemFree(p->pooled); cuMemFree(p->o);
+    cuMemFree(p->out); cuMemFree(p->wts);
 #ifdef PX_CALIB
+    cuMemFree(p->logit); cuMemFree(p->ws);
     cuMemFree(p->amax); cuMemFree(p->spar);
 #endif
     if (p->mod) cuModuleUnload(p->mod);

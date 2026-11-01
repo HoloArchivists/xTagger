@@ -256,6 +256,18 @@ __device__ __forceinline__ void mma16832(float *c, const unsigned *a, unsigned b
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// fp16 m16n8k16, non-volatile like mma16832. Its A / B fragments sit at the same byte offsets per lane as the E4M3
+// k32 ones (a0: row g, bytes 4t..4t+3; a2: row g, bytes 16+4t..; b0 / b1 likewise), so gemm8's byte-addressed
+// pipeline runs fp16 operands unchanged with this MMA and K counted in bytes.
+__device__ __forceinline__ void mma16816h(float *c, const unsigned *a, unsigned b0, unsigned b1)
+{
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+#define MMAK(H, c, a, b0, b1) ((H) ? mma16816h(c, a, b0, b1) : mma16832(c, a, b0, b1))
+
 // Block GEMM main loop: acc (+)= X[m0 + 32 warp ..][0, K) * W[0, BN)[0, K)^T for this warp's 32 rows x BN columns.
 // Block tile 128 x BN, 4 warps, 64-byte k steps through a GS-stage cp.async ring at shared address sb
 // (GS * (128 + BN) * 64 bytes). Rows of X past `rows` and k past K load as zero. X and W rows are K bytes apart.
@@ -284,12 +296,13 @@ __device__ __forceinline__ void mma16832(float *c, const unsigned *a, unsigned b
     do {                                                                                \
         for (mt = 0; mt < 2; mt++)                                                      \
             for (n = 0; n < BN / 16; n++) {                                             \
-                mma16832(acc[mt][2 * n], a[f][mt], b[f][n][0], b[f][n][1]);             \
-                mma16832(acc[mt][2 * n + 1], a[f][mt], b[f][n][2], b[f][n][3]);         \
+                MMAK(H, acc[mt][2 * n], a[f][mt], b[f][n][0], b[f][n][1]);              \
+                MMAK(H, acc[mt][2 * n + 1], a[f][mt], b[f][n][2], b[f][n][3]);          \
             }                                                                           \
     } while (0)
 
-template <int BN, int K>
+// H = 1: fp16 operands (mma16816h), K still in bytes (two halves per byte pair).
+template <int BN, int K, int H = 0>
 __device__ __forceinline__ void gemm8(const unsigned char *__restrict__ x, const unsigned char *__restrict__ w,
                                       unsigned m0, unsigned rows, unsigned sb, float (&acc)[2][BN / 8][4])
 {
@@ -312,6 +325,7 @@ __device__ __forceinline__ void gemm8(const unsigned char *__restrict__ x, const
     xa = x + (size_t)(m0 + (tid >> 2)) * K + 16 * (tid & 3);
     wa = w + (size_t)(tid >> 2) * K + 16 * (tid & 3);
     da = SWV(tid >> 2, tid & 3);
+#pragma unroll
     for (mt = 0; mt < 2; mt++)
         for (n = 0; n < BN / 8; n++) acc[mt][n][0] = acc[mt][n][1] = acc[mt][n][2] = acc[mt][n][3] = 0.f;
     for (kt = 0; kt < GS - 1; kt++) {
@@ -339,6 +353,36 @@ __device__ __forceinline__ void gemm8(const unsigned char *__restrict__ x, const
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
     __syncthreads();
+}
+
+// Patch embedding on gemm8's pipeline in fp16: residual rows of patch token m (fp16, fp32 accumulate) =
+// in [rows][K0P] . pe [1024][K0P]^T. CLS: each image's 1024 patches sit after its cls row (x row m + m / 1024 + 1),
+// else row m. Grid (1024 / 128, rows / 128), rows a multiple of 128.
+template <int CLS>
+__device__ __forceinline__ void patch_gemm(const __half *__restrict__ in, const __half *__restrict__ pe,
+                                           res_t *__restrict__ x, unsigned rows)
+{
+    __shared__ __align__(128) unsigned char sm[GS * 256 * 64];
+    float acc[2][16][4];
+    unsigned lane, warp, m0, mt, nt, i, m, n;
+
+    lane = threadIdx.x & 31;
+    warp = threadIdx.x >> 5;
+    m0 = blockIdx.y * 128;
+    gemm8<128, K0P * 2, 1>((const unsigned char *)in, (const unsigned char *)(pe + (size_t)blockIdx.x * 128 * K0P), m0,
+                           rows, (unsigned)__cvta_generic_to_shared(sm), acc);
+#pragma unroll
+    for (mt = 0; mt < 2; mt++)
+#pragma unroll
+        for (i = 0; i < 2; i++) {
+            m = m0 + warp * 32 + mt * 16 + (lane >> 2) + 8 * i;
+            m = CLS ? m + (m >> 10) + 1 : m;
+#pragma unroll
+            for (nt = 0; nt < 16; nt++) {
+                n = blockIdx.x * 128 + 8 * nt + 2 * (lane & 3);
+                *(__half2 *)(x + (size_t)m * D + n) = __floats2half2_rn(acc[mt][nt][2 * i], acc[mt][nt][2 * i + 1]);
+            }
+        }
 }
 
 
@@ -630,4 +674,54 @@ extern "C" __global__ void k_head(const float *__restrict__ logit, const float *
     b = i / nt;
     j = i - b * nt;
     out[i] = 1.0f / (1.0f + __expf(-(logit[(size_t)b * ntp + j] + bias[j])));
+}
+
+// Tag head as a batched GEMV with the sigmoid fused: out [nb][nt] = sigmoid(a [nb][1024] . w[n]^T + bias[n]), fp16
+// a and w, nb <= 8. The weights stream once per batch; every row of a sits in shared memory. One warp per column,
+// 8 columns per warp (q = 4 column-quarters x 8 columns, one flat loop), 64 columns per 256-thread block.
+#define HMV_COLS 64
+#define HMV_DOT(wv, av, s)                                                              \
+    do {                                                                                \
+        wf = __half22float2(((const __half2 *)&(wv))[0]); af = __half22float2(((const __half2 *)&(av))[0]); \
+        s = fmaf(wf.x, af.x, fmaf(wf.y, af.y, s));                                      \
+        wf = __half22float2(((const __half2 *)&(wv))[1]); af = __half22float2(((const __half2 *)&(av))[1]); \
+        s = fmaf(wf.x, af.x, fmaf(wf.y, af.y, s));                                      \
+        wf = __half22float2(((const __half2 *)&(wv))[2]); af = __half22float2(((const __half2 *)&(av))[2]); \
+        s = fmaf(wf.x, af.x, fmaf(wf.y, af.y, s));                                      \
+        wf = __half22float2(((const __half2 *)&(wv))[3]); af = __half22float2(((const __half2 *)&(av))[3]); \
+        s = fmaf(wf.x, af.x, fmaf(wf.y, af.y, s));                                      \
+    } while (0)
+
+extern "C" __global__ void __launch_bounds__(256) k_headmv(const __half *__restrict__ a, const __half *__restrict__ w,
+                                                          const float *__restrict__ bias, float *__restrict__ out,
+                                                          unsigned nt, unsigned nb)
+{
+    __shared__ __align__(16) __half sa[8 * D];
+    uint4 wv, av;
+    float2 wf, af;
+    float acc[8], s, o;
+    unsigned lane, n, b, q, j;
+
+    for (q = threadIdx.x; q < nb * D / 8; q += 256) ((uint4 *)sa)[q] = ((const uint4 *)a)[q];
+    __syncthreads();
+    lane = threadIdx.x & 31;
+    for (b = 0; b < 8; b++) acc[b] = 0.f;
+    for (q = 0; q < 32; q++) {
+        n = blockIdx.x * HMV_COLS + (threadIdx.x >> 5) * 8 + (q >> 2);
+        j = q & 3;
+        if (n >= nt) break; // warp-uniform: later columns of this warp are past nt too
+        wv = __ldg((const uint4 *)(w + (size_t)n * D) + lane + 32 * j);
+        for (b = 0; b < 8; b++) {
+            if (b >= nb) break;
+            av = ((const uint4 *)(sa + b * D))[lane + 32 * j];
+            HMV_DOT(wv, av, acc[b]);
+        }
+        if (j != 3) continue;
+        for (b = 0, o = 0.f; b < 8; b++) {
+            s = warp_sum(acc[b]);
+            o = lane == b ? s : o;
+            acc[b] = 0.f;
+        }
+        if (lane < nb) out[(size_t)lane * nt + n] = 1.0f / (1.0f + __expf(-(o + bias[n])));
+    }
 }

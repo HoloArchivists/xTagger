@@ -9,6 +9,7 @@
 #include <string.h>
 #include <math.h>
 #include "px.h"
+#include "npu.h"
 #include "hp.h"
 
 // Define Tile Size
@@ -32,12 +33,13 @@
 // Per band the accumulators collapse per tile, butterfly-reduce to one byte per
 // tile and classify in the same register.
 //
-// Requirements: src and dst 32-byte aligned, stride a multiple of 32 and
-// >= row bytes rounded up to 32, 64 readable bytes past the last row, ts a
-// power of two >= 32, row bytes >= 32.
+// Requirements: src and dst 32-byte aligned (the _ro scans: any alignment, any
+// stride), stride a multiple of 32 and >= row bytes rounded up to 32, 64
+// readable bytes past the last row, ts a multiple of 8 >= 32 (every tile row
+// then covers whole 32-byte chunks: -t 448 matches wd's input), row bytes >= 32.
 // Output per band: plan.pitch tile bytes, plan.words violation words (1 bit per tile).
 
-#define XF_MAX_CHUNKS 2048 // 32-byte chunks per row
+#define XF_MAX_CHUNKS 4096 // 32-byte chunks per row (RGBA rows up to 32768 px)
 #define XF_MAX_COLS   1024
 #define XF_PITCH(cols) (((cols) + 31u) & ~31u)
 #ifndef XF_PF_DIST
@@ -49,6 +51,7 @@
 
 #define XF_X(a, b) _mm256_xor_si256(a, b)
 #define XF_NTLD(p) _mm256_stream_load_si256((__m256i const *)(p))
+#define XF_LDU(p) _mm256_loadu_si256((__m256i const *)(p)) // _ro scans run on the decoder's rows (w * 4 apart)
 #define XF_NTST(p, v) _mm256_stream_si256((__m256i *)(p), v)
 #define XF_NOST(p, v) ((void)(p), (void)(v))
 #define XF_PAIR(a, b, W) XF_X(_mm256_unpacklo_epi##W(a, b), _mm256_unpackhi_epi##W(a, b))
@@ -96,11 +99,10 @@ static inline void xf_plan_init(xf_plan *p, const xf_ctx *x, uint32_t w, uint32_
                                 uint32_t ts, uint32_t bpp, uint32_t rgba)
 {
     __m256i tmask, ones;
-    uint32_t wb, twb, tsh, full, odd, k, t, off, nextb, adv;
+    uint32_t wb, twb, full, odd, k, t, off, nextb, adv;
 
     wb = w * bpp;
     twb = ts * bpp;
-    tsh = (uint32_t)__builtin_ctz(ts);
     full = wb >> 5;
     odd = full & 1;
     tmask = _mm256_loadu_si256((const __m256i *)(x->keep8 + 32 - (wb & 31)));
@@ -112,8 +114,8 @@ static inline void xf_plan_init(xf_plan *p, const xf_ctx *x, uint32_t w, uint32_
     p->lowmask = _mm256_set1_epi32(rgba ? 0xFF : -1);
     p->dpitch = p->npair << 6;
     p->stride = stride;
-    p->band_src = stride << tsh;
-    p->band_dst = (size_t)p->dpitch << tsh;
+    p->band_src = stride * ts;
+    p->band_dst = (size_t)p->dpitch * ts;
     p->ts = ts;
 
     for (k = 0, t = 0, nextb = twb; k < 2 * p->npair; k++) {
@@ -127,8 +129,8 @@ static inline void xf_plan_init(xf_plan *p, const xf_ctx *x, uint32_t w, uint32_
     p->pitch = XF_PITCH(p->cols);
     p->words = p->pitch >> 5;
     p->lastword = ~0u >> ((32 - (p->cols & 31)) & 31);
-    p->bands = (h + ts - 1) >> tsh;
-    p->lasth = h - ((p->bands - 1) << tsh);
+    p->bands = (h + ts - 1) / ts;
+    p->lasth = h - (p->bands - 1) * ts;
     p->lastoff = (p->cols - 1) * twb;
     p->oddw = ((wb - p->lastoff) >> __builtin_ctz(bpp)) & 1;
     p->oddsel = (uint32_t)((1ull << (8 * bpp)) - 1);
@@ -148,7 +150,7 @@ static inline __m256i xf_reduce32(__m256i *a)
 
 // bh rows, 64 bytes per iteration, one prefetch per line. The final pair of every
 // row always runs under plan.m0/m1, so partial rows need no branch.
-#define XF_DEF_BAND(name, XFORM, STORE)                                                 \
+#define XF_DEF_BAND(name, XFORM, STORE, LOAD)                                           \
 static inline void name(xf_ctx *x, const xf_plan *p, const uint8_t *s, uint8_t *d,      \
                         uint32_t bh)                                                    \
 {                                                                                       \
@@ -164,15 +166,15 @@ static inline void name(xf_ctx *x, const xf_plan *p, const uint8_t *s, uint8_t *
     for (y = 0; y < bh; y++, s += stride, d += dpitch) {                                \
         for (k = 0; k < n; k++) {                                                       \
             XF_PF(s + 64 * k);                                                          \
-            v0 = XF_NTLD(s + 64 * k);                                                   \
-            v1 = XF_NTLD(s + 64 * k + 32);                                              \
+            v0 = LOAD(s + 64 * k);                                                      \
+            v1 = LOAD(s + 64 * k + 32);                                                 \
             STORE(d + 64 * k, v0);                                                      \
             STORE(d + 64 * k + 32, v1);                                                 \
             x->acc[2 * k] = XF_X(x->acc[2 * k], XFORM(v0));                             \
             x->acc[2 * k + 1] = XF_X(x->acc[2 * k + 1], XFORM(v1));                     \
         }                                                                               \
-        v0 = _mm256_and_si256(XF_NTLD(s + 64 * k), m0);                                 \
-        v1 = _mm256_and_si256(XF_NTLD(s + 64 * k + 32), m1);                            \
+        v0 = _mm256_and_si256(LOAD(s + 64 * k), m0);                                    \
+        v1 = _mm256_and_si256(LOAD(s + 64 * k + 32), m1);                               \
         STORE(d + 64 * k, v0);                                                          \
         STORE(d + 64 * k + 32, v1);                                                     \
         x->acc[2 * k] = XF_X(x->acc[2 * k], XFORM(v0));                                 \
@@ -180,10 +182,10 @@ static inline void name(xf_ctx *x, const xf_plan *p, const uint8_t *s, uint8_t *
     }                                                                                   \
 }
 
-XF_DEF_BAND(xf_band_plane, XF_ID, XF_NTST)
-XF_DEF_BAND(xf_band_rgba, XF_GRAY4, XF_NTST)
-XF_DEF_BAND(xf_band_plane_ro, XF_ID, XF_NOST)
-XF_DEF_BAND(xf_band_rgba_ro, XF_GRAY4, XF_NOST)
+XF_DEF_BAND(xf_band_plane, XF_ID, XF_NTST, XF_NTLD)
+XF_DEF_BAND(xf_band_rgba, XF_GRAY4, XF_NTST, XF_NTLD)
+XF_DEF_BAND(xf_band_plane_ro, XF_ID, XF_NOST, XF_LDU)
+XF_DEF_BAND(xf_band_rgba_ro, XF_GRAY4, XF_NOST, XF_LDU)
 
 // Band accumulators -> per-tile ymm -> one byte per tile -> violation bits.
 // odd is xored into the last tile (flat odd-area correction, already masked).
@@ -398,10 +400,17 @@ enum { PI_FREE, PI_LIVE };
 
 typedef struct {
     uint32_t ts, lo, hi, mode, minw, minh, maxw, maxh, maxmvi, nocrops;
+    uint32_t noalpha;        // -na: ignore alpha (no composite; transparent pixels keep the RGB the exporter left)
     int32_t route, rconf;    // route: -1 router, else PI_D..PI_C forced; rconf: perceptron sum to trust a route (-1: theta / 2)
     float weight_thresh, gain, gen_thresh, char_thresh, agree, explore;
     int device;
     const char *px;          // pixai.bin (NULL: wd only); vocabulary in <px>.tags
+    const char *npu;         // eva02 fp16 weights (v2): wd full images also run on the NPU (NULL: GPU only)
+    uint32_t steal, scap, scats; // -s: wd's head learns from PixAI (steal.h); extra rows (shared with -g); PixAI
+                                 // categories (bit c)
+    uint32_t glean;          // -g: tagglomeration, wd's head learns from <image>.txt sidecars (tagg.h)
+    const char *sfile;       // -sf / -gf: the learned head (stolen rows, user tags) kept across runs (NULL: this run)
+    float gk;                // -gk: user tags fire this many background sigmas above the background median
 } pi_params;
 
 static inline pi_params pi_defaults(void)
@@ -418,6 +427,7 @@ static inline pi_params pi_defaults(void)
     p.maxh = 0;
     p.maxmvi = 8;
     p.nocrops = 0;
+    p.noalpha = 0;
     p.route = -1;
     p.rconf = -1;
     p.weight_thresh = 0.5f;
@@ -428,6 +438,13 @@ static inline pi_params pi_defaults(void)
     p.explore = 1.0f / 32.0f;
     p.device = 0;
     p.px = NULL;
+    p.npu = NULL;
+    p.steal = 0;
+    p.glean = 0;
+    p.scap = 4096;
+    p.scats = 1u << 3 | 1u << 4; // copyright, character
+    p.sfile = NULL;
+    p.gk = 3.0f; // TG_K0
     return p;
 }
 
@@ -444,16 +461,40 @@ typedef struct {
     float area[PI_MAX_MVI];  // crop area / grid area
 } pi_result;
 
+// Image pyramid: level 0 = the decoder's RGBX (malloc'd, rows lw * 4 apart, 64 bytes of slack), levels 1.. 2x2 boxes
+// in one _mm_malloc block starting at lv[1].
+#define PI_LV     12
+#define PI_PYRMIN (2 * EVA_S)
+typedef struct {
+    uint8_t *lv[PI_LV];
+    size_t ls[PI_LV];
+    uint32_t lw[PI_LV], lh[PI_LV], nlv;
+} pi_pyr;
+
+// One decoded image as the workers hand it over: pyramid, alpha, and the xorfold grid when crops are possible.
+typedef struct {
+    pi_pyr p;
+    uint32_t alpha, folded, words, pitch;
+    char *side;              // -s: sidecar tags (tg_read: packed names, malloc'd; the tagger takes it), nside of them
+    uint32_t nside;
+    uint8_t tiles[PI_MAX_GRID * PI_MAX_GRID];
+    uint32_t mask[PI_MAX_GRID * 2];
+} pi_img;
+
 typedef struct {
     pi_result res;
     uint16_t *in;            // wd inputs in the pinned pool: [0] full image, [1 + i] crop i (EVA_IN halves)
     float *out, *pout;       // wd / PixAI outputs: [0] full image, [1 + i] crop i
-    uint8_t *rgba;           // source pixels (owned), kept while PixAI inputs may still be prepared from them
+    uint16_t *pn;            // -s: wd head inputs, same indexing; bit i of pnv: input i has one (GPU passes only)
+    uint32_t pnv;
+    char *side;              // sidecar tags (owned), nside of them
+    uint32_t nside;
+    pi_pyr pyr;            // source pyramid (owned), kept while any input may still be prepared from it
     void *user;
-    size_t istride;
     uint32_t w, h, alpha, state, route, explore;
     uint32_t pend;           // inputs queued or in flight
     uint32_t prep;           // PixAI inputs still to prepare: bit 0 full image, bit 1 + i crop i
+    uint32_t wprep;          // wd crops deferred (t->defer): prepared from the pyramid when pi_pump queues them
     uint32_t wait;           // decisions pending: 1 wd full pass (crop gate, router stage 2), 2 PixAI crop gate
     uint32_t i1[PI_F1], i2[PI_F2]; // perceptron rows
 } pi_job;
@@ -474,6 +515,24 @@ typedef struct {
     uint32_t *hash;          // CRC32C of the name
 } pi_voc;
 
+static inline uint32_t pi_hash(const char *s)
+{
+    uint64_t v;
+    size_t n, i;
+    uint32_t h;
+
+    n = strlen(s);
+    for (i = 0, h = 0xFFFFFFFFu; i + 8 <= n; i += 8) {
+        memcpy(&v, s + i, 8);
+        h = (uint32_t)_mm_crc32_u64(h, v);
+    }
+    for (; i < n; i++) h = _mm_crc32_u8(h, (uint8_t)s[i]);
+    return h ? h : 1;
+}
+
+#include "steal.h"
+#include "tagg.h"
+
 typedef struct pi_tagger pi_tagger;
 typedef void (*pi_done_fn)(pi_tagger *t, void *user, pi_result *res);
 
@@ -481,17 +540,15 @@ struct pi_tagger {
     pi_params prm;
     eva e;
     px p;
+    npu n;                   // with -npu: wd full images go here whenever a slot is free
     pi_done_fn done;
     pi_voc wv, pv;           // wd / PixAI vocabularies
     hp r1, r2;               // router stage 1 (push) / stage 2 (+ wd full pass)
     __m128i rng, rkey;       // AES-NI counter: exploration draws
     int32_t c1, c2;          // stage confidence (perceptron sum)
-    uint32_t S, mt_cap, maxmvi, haspx, routed, owner, err; // owner: job whose composite is in rgbx (PI_JOBS: none)
-    xf_ctx *x;
-    xf_plan *plan;
+    uint32_t S, mt_cap, maxmvi, haspx, routed, err;
     pi_sel *sel;
-    uint8_t *rgbx;           // composited RGBX, 32-aligned rows, 64 bytes slack
-    size_t rgbx_cap, stride, tmp_cap;
+    size_t tmp_cap;
     float *tmp, *wx, *wy, *kx, *ky;
     int32_t *sx, *nx, *sy, *ny;
     uint32_t *jo;            // output column j -> half offset of its pixel inside a patch row band
@@ -513,8 +570,12 @@ struct pi_tagger {
     uint32_t rh, rt;
     uint32_t defer[PI_JOBS], ndefer, fin[PI_JOBS], nfin; // wd crops to queue; jobs to retire
     uint32_t nroute[5], nok[3], hit1[3], hit2[3]; // router statistics (numbers only)
-    uint8_t tiles[PI_MAX_GRID * PI_MAX_GRID];
-    uint32_t mask[PI_MAX_GRID * 2];
+    uint32_t hasnpu, nnpu;   // NPU engine opened; wd full passes it ran
+    uint16_t nown[NPU_NBUF]; // job of each NPU slot
+    uint32_t nt0, steal, glean, learn; // wd tags in the file (the rest of wv are stolen rows and user tags); -s; -g;
+                                       // either (the extra rows, head inputs, the head file)
+    st_learn st;
+    tg_learn tg;             // sidecar tags (tagglomeration)
 };
 
 #define PI_A32(n) (((size_t)(n) + 31) & ~(size_t)31)
@@ -555,11 +616,11 @@ static inline void pi_row_rgbx(uint8_t *d, const uint8_t *s, uint32_t w, uint32_
             lo = _mm256_unpacklo_epi8(v, zero);
             hi = _mm256_unpackhi_epi8(v, zero);
             v = _mm256_packus_epi16(PI_OVER(lo, ashuf, c255, k128), PI_OVER(hi, ashuf, c255, k128));
-            _mm256_store_si256((__m256i *)(d + 4 * i), _mm256_or_si256(v, ff));
+            _mm256_storeu_si256((__m256i *)(d + 4 * i), _mm256_or_si256(v, ff));
         }
     } else {
         for (i = 0; i + 8 <= w; i += 8)
-            _mm256_store_si256((__m256i *)(d + 4 * i), _mm256_or_si256(_mm256_loadu_si256((const __m256i *)(s + 4 * i)), ff));
+            _mm256_storeu_si256((__m256i *)(d + 4 * i), _mm256_or_si256(_mm256_loadu_si256((const __m256i *)(s + 4 * i)), ff));
     }
     for (; i < w; i++) {
         a = alpha ? s[4 * i + 3] : 255;
@@ -571,19 +632,119 @@ static inline void pi_row_rgbx(uint8_t *d, const uint8_t *s, uint32_t w, uint32_
     }
 }
 
-static inline void pi_load(pi_tagger *t, const uint8_t *rgba, uint32_t w, uint32_t h, size_t in_stride, uint32_t alpha)
+// One row of a 2x2 box level: wn output pixels from rows s, s + ss of the level above. Rows average rounding up
+// (vpavgb), columns rounding down (avg - ((a ^ b) & 1)), so the two biases cancel. 16 source pixels per step:
+// vshufps splits even / odd pixels per lane, vpermq restores pixel order.
+static inline void pi_half(uint8_t *d, const uint8_t *s, size_t ss, uint32_t wn)
 {
-    uint32_t y;
-    size_t need;
+    __m256i v0, v1, e, o, one;
+    uint32_t x, c, ve, vo;
 
-    t->stride = PI_A32((size_t)w * 4);
-    need = t->stride * h + 64;
-    PI_GROW(t->rgbx, t->rgbx_cap, need, uint8_t);
-    for (y = 0; y < h; y++) {
-        _mm_prefetch((const char *)(rgba + (y + 1) * in_stride), _MM_HINT_T0);
-        pi_row_rgbx(t->rgbx + y * t->stride, rgba + y * in_stride, w, alpha);
+    one = _mm256_set1_epi8(1);
+    for (x = 0; x + 8 <= wn; x += 8) {
+        v0 = _mm256_avg_epu8(_mm256_loadu_si256((const __m256i *)(s + 8 * x)),
+                             _mm256_loadu_si256((const __m256i *)(s + ss + 8 * x)));
+        v1 = _mm256_avg_epu8(_mm256_loadu_si256((const __m256i *)(s + 8 * x + 32)),
+                             _mm256_loadu_si256((const __m256i *)(s + ss + 8 * x + 32)));
+        e = _mm256_castps_si256(_mm256_shuffle_ps(_mm256_castsi256_ps(v0), _mm256_castsi256_ps(v1), 0x88));
+        o = _mm256_castps_si256(_mm256_shuffle_ps(_mm256_castsi256_ps(v0), _mm256_castsi256_ps(v1), 0xDD));
+        v0 = _mm256_sub_epi8(_mm256_avg_epu8(e, o), _mm256_and_si256(_mm256_xor_si256(e, o), one));
+        _mm256_storeu_si256((__m256i *)(d + 4 * x), _mm256_permute4x64_epi64(v0, 0xD8));
     }
-    memset(t->rgbx + t->stride * h, 255, 64);
+    for (; x < wn; x++)
+        for (c = 0; c < 4; c++) {
+            ve = (s[8 * x + c] + s[ss + 8 * x + c] + 1u) >> 1;
+            vo = (s[8 * x + 4 + c] + s[ss + 8 * x + 4 + c] + 1u) >> 1;
+            d[4 * x + c] = (uint8_t)((ve + vo) >> 1);
+        }
+}
+
+// Levels 1.. of p (level 0 already set): halve while the next level is still >= PI_PYRMIN on its long side, so every
+// request (side, S >= EVA_S) finds a level it resamples from by a factor in [2, 4). One block, 64 bytes of slack.
+// No memory: level 0 only (every request still resamples correctly, just from full resolution).
+static inline void pi_pyramid(pi_pyr *p)
+{
+    uint8_t *blk;
+    size_t total;
+    uint32_t n, L, y;
+
+    for (n = 1, total = 0; n < PI_LV; n++) {
+        if (((p->lw[n - 1] > p->lh[n - 1] ? p->lw[n - 1] : p->lh[n - 1]) >> 1) < PI_PYRMIN || p->lw[n - 1] < 2
+            || p->lh[n - 1] < 2) break;
+        p->lw[n] = p->lw[n - 1] >> 1;
+        p->lh[n] = p->lh[n - 1] >> 1;
+        p->ls[n] = PI_A32((size_t)p->lw[n] * 4);
+        total += p->ls[n] * p->lh[n];
+    }
+    p->nlv = 1;
+    if (n == 1 || !(blk = _mm_malloc(total + 64, 64))) return;
+    for (L = 1; L < n; L++) {
+        p->lv[L] = blk;
+        blk += p->ls[L] * p->lh[L];
+        for (y = 0; y < p->lh[L]; y++)
+            pi_half(p->lv[L] + y * p->ls[L], p->lv[L - 1] + 2 * y * p->ls[L - 1], p->ls[L - 1], p->lw[L]);
+    }
+    p->nlv = n;
+}
+
+// Coarsest level that still leaves a resample factor >= 2 for a side-pixel request at model size S.
+static inline uint32_t pi_level(const pi_pyr *p, uint32_t side, uint32_t S)
+{
+    uint32_t L;
+
+    for (L = 0; L + 1 < p->nlv && (side >> (L + 1)) >= 2 * S; L++);
+    return L;
+}
+
+// Level-0 rect (x0, y0, cw, ch) -> the same rect on level L (clipped, at least one pixel); returns its first pixel.
+static inline const uint8_t *pi_lsrc(const pi_pyr *p, uint32_t L, uint32_t *x0, uint32_t *y0, uint32_t *cw, uint32_t *ch)
+{
+    uint32_t x1, y1;
+
+    x1 = (*x0 + *cw) >> L;
+    y1 = (*y0 + *ch) >> L;
+    x1 = x1 < p->lw[L] ? x1 : p->lw[L];
+    y1 = y1 < p->lh[L] ? y1 : p->lh[L];
+    *x0 >>= L;
+    *y0 >>= L;
+    *x0 = *x0 < p->lw[L] ? *x0 : p->lw[L] - 1;
+    *y0 = *y0 < p->lh[L] ? *y0 : p->lh[L] - 1;
+    *cw = x1 > *x0 ? x1 - *x0 : 1;
+    *ch = y1 > *y0 ? y1 - *y0 : 1;
+    return p->lv[L] + (size_t)*y0 * p->ls[L] + (size_t)*x0 * 4;
+}
+
+// Worker side of one decoded image (im->p level 0 set: rows w * 4 apart, 64 bytes of slack): alpha over white in
+// place, the xorfold of the grid when crops are possible, the pyramid. Everything the main thread would otherwise
+// redo per crop is done here once, off the scheduler's thread.
+static inline void pi_ingest(const pi_params *prm, xf_ctx *x, xf_plan *pl, pi_img *im)
+{
+    uint8_t *row;
+    uint32_t w, h, y, rows, cols;
+
+    w = im->p.lw[0];
+    h = im->p.lh[0];
+    if (im->alpha && !prm->noalpha)
+        for (y = 0, row = im->p.lv[0]; y < h; y++, row += im->p.ls[0]) pi_row_rgbx(row, row, w, 1);
+    rows = (h + prm->ts - 1) / prm->ts;
+    cols = (w + prm->ts - 1) / prm->ts;
+    im->folded = !prm->nocrops && rows >= prm->minh && cols >= prm->minw && rows <= PI_MAX_GRID && cols <= PI_MAX_GRID
+              && w >= 8 && (w > EVA_S || h > EVA_S) && (size_t)w * 4 <= (XF_MAX_CHUNKS - 2) * 32u;
+    if (im->folded) {
+        xf_plan_init(pl, x, w, h, im->p.ls[0], prm->ts, 4, 1);
+        xf_scan_rgba(x, pl, im->p.lv[0], im->p.lv[0], im->tiles, im->mask);
+        im->words = pl->words;
+        im->pitch = pl->pitch;
+    }
+    pi_pyramid(&im->p);
+}
+
+static inline void pi_pyr_free(pi_pyr *p)
+{
+    free(p->lv[0]);
+    if (p->nlv > 1) _mm_free(p->lv[1]);
+    p->lv[0] = NULL;
+    p->nlv = 0;
 }
 
 static inline float pi_cubic(float x)
@@ -706,6 +867,39 @@ static inline void pi_hrow(const float *tmp, uint32_t S, uint32_t mt, const floa
     }
 }
 
+// Scale-1 row (the rect's side equals the model's): no taps, the bicubic / triangle at scale 1 is exactly the
+// identity. Pixels [ox, ox + cw) come from s (RGBX) as v / 127.5 - 1, the rest is pad (fp16 bits: white 0x3C00 for
+// wd, black 0xBC00 for PixAI); s NULL: a pad row. Same planar scatter as pi_hrow.
+static inline void pi_idrow(const uint8_t *s, uint32_t cw, uint32_t ox, uint32_t S, uint16_t pad, const uint32_t *jo,
+                            __m128i ord, uint16_t *out)
+{
+    __m128 sc, m1;
+    __m128i hv;
+    uint16_t *o;
+    uint32_t j, e;
+
+    sc = _mm_set1_ps(1.0f / 127.5f);
+    m1 = _mm_set1_ps(-1.0f);
+    e = s ? ox + cw : 0;
+    ox = s ? ox : S;
+    for (j = 0; j < ox; j++) {
+        o = out + jo[j];
+        o[0] = o[196] = o[392] = pad;
+    }
+    for (; j < e; j++) {
+        hv = _mm_cvtps_ph(_mm_permutevar_ps(_mm_fmadd_ps(_mm_cvtepi32_ps(_mm_cvtepu8_epi32(
+                 _mm_cvtsi32_si128(*(const int *)(s + 4 * (j - ox))))), sc, m1), ord), _MM_FROUND_TO_NEAREST_INT);
+        o = out + jo[j];
+        o[0] = (uint16_t)_mm_extract_epi16(hv, 2);
+        o[196] = (uint16_t)_mm_extract_epi16(hv, 1);
+        o[392] = (uint16_t)_mm_extract_epi16(hv, 0);
+    }
+    for (; j < S; j++) {
+        o = out + jo[j];
+        o[0] = o[196] = o[392] = pad;
+    }
+}
+
 // 14 output rows complete one band: 32 whole patches, 37888 contiguous bytes of the operand. Stream it out
 // (non-temporal: the GPU reads it, the CPU never will) from the cache-resident staging band.
 #define PI_BANDH (32 * EVA_K0P)
@@ -724,16 +918,35 @@ static inline void pi_stream(uint16_t *dst, const uint16_t *band, uint32_t n32)
     }
 }
 
-// Crop (x0, y0, cw, ch) of the RGBX buffer -> one model input (EVA_IN halves) at out (32-byte aligned, pinned):
-// written once, band by band, with streaming stores, fenced at the end so the DMA sees all of it.
-static inline void pi_prep(pi_tagger *t, uint32_t x0, uint32_t y0, uint32_t cw, uint32_t ch, uint16_t *out)
+// Crop (x0, y0, cw, ch) of the image (level-0 pixels) -> one model input (EVA_IN halves) at out (32-byte aligned,
+// pinned), resampled from the pyramid level that leaves a factor in [2, 4): the cost follows the output, not the
+// crop. A rect whose long side is already S (e.g. -t 448 crops) skips the resample: scale 1 is the identity, so the
+// pixels are only normalised and white-padded. Written once, band by band, with streaming stores, fenced at the end
+// so the DMA sees all of it.
+static inline void pi_prep(pi_tagger *t, const pi_pyr *p, uint32_t x0, uint32_t y0, uint32_t cw, uint32_t ch,
+                           uint16_t *out)
 {
     const uint8_t *src;
-    uint32_t S, side, mt, i, n8;
-    size_t need;
+    size_t need, stride;
+    uint32_t S, side, mt, i, n8, L, id, ox, oy;
 
     S = t->S;
+    L = pi_level(p, cw > ch ? cw : ch, S);
+    src = pi_lsrc(p, L, &x0, &y0, &cw, &ch);
+    stride = p->ls[L];
     side = cw > ch ? cw : ch;
+    id = side == S;
+    ox = (S - cw) >> 1;
+    oy = (S - ch) >> 1;
+    if (id) {
+        for (i = 0; i < S; i++) {
+            pi_idrow((uint32_t)(i - oy) < ch ? src + (size_t)(i - oy) * stride : NULL, cw, ox, S, 0x3C00, t->jo,
+                     PI_BGR, t->band + (i % 14) * 14);
+            if (i % 14 == 13) pi_stream(out + (size_t)(i / 14) * PI_BANDH, t->band, PI_BANDH * 2 / 32);
+        }
+        _mm_sfence();
+        return;
+    }
     mt = 2 * (uint32_t)(2.0f * (side > S ? (float)side / (float)S : 1.0f) + 1.0f) + 2;
     if (mt > t->mt_cap) {
         _mm_free(t->wx);
@@ -747,9 +960,8 @@ static inline void pi_prep(pi_tagger *t, uint32_t x0, uint32_t y0, uint32_t cw, 
     PI_GROW(t->tmp, t->tmp_cap, need, float);
     pi_axis(S, side, (side - cw) >> 1, cw, mt, 1.0f / 127.5f, -1.0f, t->wx, t->sx, t->nx, t->kx);
     pi_axis(S, side, (side - ch) >> 1, ch, mt, 1.0f, 0.0f, t->wy, t->sy, t->ny, t->ky);
-    src = t->rgbx + (size_t)y0 * t->stride + (size_t)x0 * 4;
     for (i = 0; i < S; i++) {
-        pi_vrow(src, t->stride, n8, t->wy + (size_t)i * mt, t->sy[i], t->ny[i], t->ky[i], t->tmp);
+        pi_vrow(src, stride, n8, t->wy + (size_t)i * mt, t->sy[i], t->ny[i], t->ky[i], t->tmp);
         pi_hrow(t->tmp, S, mt, t->wx, t->sx, t->nx, t->kx, t->jo, PI_BGR, t->band + (i % 14) * 14);
         if (i % 14 == 13) pi_stream(out + (size_t)(i / 14) * PI_BANDH, t->band, PI_BANDH * 2 / 32);
     }
@@ -799,15 +1011,28 @@ static inline void pi_axis_px(uint32_t S, uint32_t len, uint32_t nl, uint32_t lo
 // Crop (x0, y0, cw, ch) -> one PixAI input (PX_IN halves, window-major patches) at out: aspect-preserving resize to
 // 1008 (int(len * r) like the reference), centred on black, RGB, [-1, 1]. Each 14-row band of 72 patches leaves as
 // 3 streamed runs of 24, one into each window of that band row.
-static inline void pi_prep_px(pi_tagger *t, uint32_t x0, uint32_t y0, uint32_t cw, uint32_t ch, uint16_t *out)
+// Output geometry (nw, nh) comes from the level-0 rect; the taps read the pyramid level.
+static inline void pi_prep_px(pi_tagger *t, const pi_pyr *p, uint32_t x0, uint32_t y0, uint32_t cw, uint32_t ch,
+                              uint16_t *out)
 {
     const uint8_t *src;
     double r;
-    uint32_t S, side, mt, i, n8, nw, nh, py, base;
-    size_t need;
+    size_t need, stride;
+    uint32_t S, side, mt, i, n8, nw, nh, py, base, L, id, ox, oy;
 
     S = PI_SMAX;
+    r = (double)S / (double)ch < (double)S / (double)cw ? (double)S / (double)ch : (double)S / (double)cw;
+    nw = (uint32_t)(cw * r);
+    nh = (uint32_t)(ch * r);
+    nw = nw ? nw : 1;
+    nh = nh ? nh : 1;
+    L = pi_level(p, cw > ch ? cw : ch, S);
+    src = pi_lsrc(p, L, &x0, &y0, &cw, &ch);
+    stride = p->ls[L];
     side = cw > ch ? cw : ch;
+    id = side == S && nw == cw && nh == ch; // scale 1: identity, pixels only normalised and black-padded
+    ox = (S - nw) >> 1;
+    oy = (S - nh) >> 1;
     mt = 2 * (uint32_t)(2.0f * (side > S ? (float)side / (float)S : 1.0f) + 1.0f) + 2;
     if (mt > t->mt_cap) {
         _mm_free(t->wx);
@@ -816,20 +1041,21 @@ static inline void pi_prep_px(pi_tagger *t, uint32_t x0, uint32_t y0, uint32_t c
         t->wy = _mm_malloc((size_t)PI_SMAX * mt * sizeof(float) + 64, 64);
         t->mt_cap = mt;
     }
-    r = (double)S / (double)ch < (double)S / (double)cw ? (double)S / (double)ch : (double)S / (double)cw;
-    nw = (uint32_t)(cw * r);
-    nh = (uint32_t)(ch * r);
-    nw = nw ? nw : 1;
-    nh = nh ? nh : 1;
     n8 = (cw * 4 + 7) >> 3;
     need = (size_t)n8 * 8 + 8;
     PI_GROW(t->tmp, t->tmp_cap, need, float);
-    pi_axis_px(S, cw, nw, (S - nw) >> 1, mt, 1.0f / 127.5f, -1.0f, -1.0f, t->wx, t->sx, t->nx, t->kx);
-    pi_axis_px(S, ch, nh, (S - nh) >> 1, mt, 1.0f, 0.0f, 0.0f, t->wy, t->sy, t->ny, t->ky);
-    src = t->rgbx + (size_t)y0 * t->stride + (size_t)x0 * 4;
+    if (!id) {
+        pi_axis_px(S, cw, nw, ox, mt, 1.0f / 127.5f, -1.0f, -1.0f, t->wx, t->sx, t->nx, t->kx);
+        pi_axis_px(S, ch, nh, oy, mt, 1.0f, 0.0f, 0.0f, t->wy, t->sy, t->ny, t->ky);
+    }
     for (i = 0; i < S; i++) {
-        pi_vrow(src, t->stride, n8, t->wy + (size_t)i * mt, t->sy[i], t->ny[i], t->ky[i], t->tmp);
-        pi_hrow(t->tmp, S, mt, t->wx, t->sx, t->nx, t->kx, t->jo, PI_RGB, t->band + (i % 14) * 14);
+        if (id) {
+            pi_idrow((uint32_t)(i - oy) < ch ? src + (size_t)(i - oy) * stride : NULL, cw, ox, S, 0xBC00, t->jo,
+                     PI_RGB, t->band + (i % 14) * 14);
+        } else {
+            pi_vrow(src, stride, n8, t->wy + (size_t)i * mt, t->sy[i], t->ny[i], t->ky[i], t->tmp);
+            pi_hrow(t->tmp, S, mt, t->wx, t->sx, t->nx, t->kx, t->jo, PI_RGB, t->band + (i % 14) * 14);
+        }
         if (i % 14 != 13) continue;
         py = i / 14;
         base = (py / 24) * 3 * 576 + (py % 24) * 24;
@@ -852,27 +1078,22 @@ static inline float pi_rect_var(const uint8_t *tiles, uint32_t pitch, pi_rect q)
     return (float)sum / (8.0f * q.h * q.w);
 }
 
-// Fold + select. Returns the MVI count; 0 means a single full-image pass. Also leaves the grid statistics the
-// router reads (tvar, req).
-static inline uint32_t pi_find_mvis(pi_tagger *t, uint32_t w, uint32_t h, pi_result *res)
+// Select on the worker's fold (pi_ingest). Returns the MVI count; 0 means a single full-image pass. Also leaves the
+// grid statistics the router reads (tvar, req).
+static inline uint32_t pi_find_mvis(pi_tagger *t, const pi_img *im, pi_result *res)
 {
     pi_sel *s;
     uint64_t v, colmask, hisel;
-    uint32_t ts, rows, cols, r, n, words, small, nreq;
+    uint32_t ts, rows, cols, r, n, words, nreq;
 
     ts = t->prm.ts;
-    rows = (h + ts - 1) / ts;
-    cols = (w + ts - 1) / ts;
+    rows = (im->p.lh[0] + ts - 1) / ts;
+    cols = (im->p.lw[0] + ts - 1) / ts;
     res->uncovered = 0;
     res->ts = ts;
     res->tvar = -1.0f;
     res->req = 0.0f;
-    small = rows < t->prm.minh || cols < t->prm.minw || rows > PI_MAX_GRID || cols > PI_MAX_GRID
-          || w < 8 || (w <= t->S && h <= t->S);
-    if (small || t->prm.nocrops) return 0;
-
-    xf_plan_init(t->plan, t->x, w, h, t->stride, ts, 4, 1);
-    xf_scan_rgba(t->x, t->plan, t->rgbx, t->rgbx, t->tiles, t->mask);
+    if (!im->folded) return 0;
 
     s = t->sel;
     s->rows = rows;
@@ -881,22 +1102,22 @@ static inline uint32_t pi_find_mvis(pi_tagger *t, uint32_t w, uint32_t h, pi_res
     s->minh = t->prm.minh;
     s->maxw = t->prm.maxw ? t->prm.maxw : cols;
     s->maxh = t->prm.maxh ? t->prm.maxh : rows;
-    words = t->plan->words;
+    words = im->words;
     hisel = words > 1 ? ~0ull : 0;
     colmask = ~0ull >> (64 - cols);
     for (r = 0, nreq = 0; r < rows; r++) {
-        v = (t->mask[r * words] | (((uint64_t)t->mask[r * words + words - 1] << 32) & hisel)) & colmask;
+        v = (im->mask[r * words] | (((uint64_t)im->mask[r * words + words - 1] << 32) & hisel)) & colmask;
         s->allow[r] = t->prm.mode == PI_ZERO ? ~v & colmask : t->prm.mode == PI_DONTCARE ? colmask : v;
         s->req[r] = t->prm.mode == PI_INVERSE ? v : ~v & colmask;
         nreq += (uint32_t)__builtin_popcountll(s->req[r]);
     }
-    res->tvar = pi_rect_var(t->tiles, t->plan->pitch, (pi_rect){0, 0, (uint8_t)rows, (uint8_t)cols});
+    res->tvar = pi_rect_var(im->tiles, im->pitch, (pi_rect){0, 0, (uint8_t)rows, (uint8_t)cols});
     res->req = (float)nreq / (float)(rows * cols);
     pi_primes(s);
     n = pi_cover(s, res->mvi, t->maxmvi, &res->uncovered);
     if (n == 1 && res->mvi[0].h == rows && res->mvi[0].w == cols) return 0;
     for (r = 0; r < n; r++) {
-        res->weight[r] = pi_rect_var(t->tiles, t->plan->pitch, res->mvi[r]);
+        res->weight[r] = pi_rect_var(im->tiles, im->pitch, res->mvi[r]);
         res->area[r] = (float)(res->mvi[r].w * res->mvi[r].h) / (float)(rows * cols);
     }
     return n;
@@ -1066,21 +1287,6 @@ static inline uint8_t *pi_map(pi_mapping *mp, const char *path, uint32_t cow)
     return mp->p;
 }
 
-static inline uint32_t pi_hash(const char *s)
-{
-    uint64_t v;
-    size_t n, i;
-    uint32_t h;
-
-    n = strlen(s);
-    for (i = 0, h = 0xFFFFFFFFu; i + 8 <= n; i += 8) {
-        memcpy(&v, s + i, 8);
-        h = (uint32_t)_mm_crc32_u64(h, v);
-    }
-    for (; i < n; i++) h = _mm_crc32_u8(h, (uint8_t)s[i]);
-    return h ? h : 1;
-}
-
 // Lines of the mapped view; each line is terminated in place (copy-on-write). The byte after a final line without
 // a newline is the zero fill of the view's last page, unless the file ends exactly on a page.
 #define PI_LINES(v, line, nl, end, BODY)                                                \
@@ -1128,7 +1334,7 @@ static inline int pi_load_csv(pi_voc *v, const char *path, const pi_params *prm)
 
     if (!pi_map(&v->map, path, 1)) return -1;
     for (n = 1, line = (char *)v->map.p; (line = memchr(line, '\n', v->map.n - (size_t)(line - (char *)v->map.p))); line++) n++;
-    if (pi_voc_alloc(v, n)) return -1;
+    if (pi_voc_alloc(v, n + (prm->steal || prm->glean ? prm->scap : 0))) return -1; // room for the extra rows
     hdr = 1;
     v->nt = 0;
     PI_LINES(v, line, nl, end, {
@@ -1374,20 +1580,23 @@ static inline void pi_learn(pi_tagger *t, pi_job *jb)
 }
 
 // ---------------------------------------------------------------- scratch / open
+// Commit every page of a pinned pool before an engine's bring-up thread page-locks it (cuMemHostRegister): inputs
+// are written with streaming stores while the registration runs, and a store racing the lock of a page not yet
+// committed was lost (early images got wrong inputs, differently run to run). One store per page; the OS zero-fills.
+#define PI_COMMIT_PAGES(p, n, o) for ((o) = 0; (o) < (n); (o) += 4096) ((volatile uint8_t *)(p))[o] = 0
 static inline int pi_scratch(pi_tagger *t, const pi_params *prm)
 {
     LARGE_INTEGER q;
+    size_t o;
     pi_job *jb;
     uint32_t j, ntmax;
 
     t->prm = *prm;
     t->S = EVA_S;
-    t->maxmvi = prm->maxmvi < 30 ? prm->maxmvi : 30; // crop bits share a u32 with the full image
-    t->owner = PI_JOBS;
-    t->x = _mm_malloc(sizeof(xf_ctx), 64);
-    t->plan = _mm_malloc(sizeof(xf_plan), 64);
+    // crop bits share a u32 with the full image; -nc: one pool input per job (the pool is page-locked whole at
+    // bring-up, so every unused slot is pinning time and memory)
+    t->maxmvi = prm->nocrops ? 0 : prm->maxmvi < 30 ? prm->maxmvi : 30;
     t->sel = _mm_malloc(sizeof(pi_sel), 64);
-    xf_init(t->x, prm->lo, prm->hi);
     t->kx = malloc(PI_SMAX * sizeof(float));
     t->ky = malloc(PI_SMAX * sizeof(float));
     t->sx = malloc(PI_SMAX * sizeof(int32_t));
@@ -1401,6 +1610,7 @@ static inline int pi_scratch(pi_tagger *t, const pi_params *prm)
     t->poolb = (size_t)PI_JOBS * (1 + t->maxmvi) * EVA_IN * 2;
     t->pool = _mm_malloc(t->poolb, 4096);
     if (!t->band || !t->pool) return -1;
+    PI_COMMIT_PAGES(t->pool, t->poolb, o);
     ntmax = t->wv.nt > t->pv.nt ? t->wv.nt : t->pv.nt;
     for (j = 0; j < 4; j++)
         if (!(t->sc[j] = _mm_malloc(ntmax * sizeof(float) + 32, 64))) return -1;
@@ -1411,18 +1621,20 @@ static inline int pi_scratch(pi_tagger *t, const pi_params *prm)
     t->uh = t->ch + PI_OH;
     for (j = 0; j < PI_JOBS; j++) {
         jb = &t->job[j];
-        jb->out = malloc((size_t)(t->maxmvi + 1) * t->wv.nt * sizeof(float));
+        jb->out = malloc((size_t)(t->maxmvi + 1) * t->wv.nt * sizeof(float) + 32); // +32: 8-wide scans of the last row
         jb->in = t->pool + (size_t)j * (1 + t->maxmvi) * EVA_IN;
         if (!jb->out) return -1;
+        if (t->learn && !(jb->pn = malloc((size_t)(t->maxmvi + 1) * EVA_D * 2))) return -1;
     }
     t->jfree = ~0u >> (32 - PI_JOBS);
     if (!t->haspx) return 0;
     t->ppoolb = (size_t)PI_PXS * PX_IN * 2;
     t->ppool = _mm_malloc(t->ppoolb, 4096);
     if (!t->ppool) return -1;
+    PI_COMMIT_PAGES(t->ppool, t->ppoolb, o);
     t->pfree = ~0u >> (32 - PI_PXS);
     for (j = 0; j < PI_JOBS; j++)
-        if (!(t->job[j].pout = malloc((size_t)(t->maxmvi + 1) * t->pv.nt * sizeof(float)))) return -1;
+        if (!(t->job[j].pout = malloc((size_t)(t->maxmvi + 1) * t->pv.nt * sizeof(float) + 32))) return -1;
     if (hp_init(&t->r1, PI_F1, PI_HROWS) || hp_init(&t->r2, PI_F2, PI_HROWS)) return -1;
     t->c1 = prm->rconf >= 0 ? prm->rconf : t->r1.theta / 2;
     t->c2 = prm->rconf >= 0 ? prm->rconf : t->r2.theta / 2;
@@ -1437,7 +1649,8 @@ static inline int pi_scratch(pi_tagger *t, const pi_params *prm)
 static inline int pi_open(pi_tagger *t, const char *model, const char *csv, const pi_params *prm, pi_done_fn done)
 {
     char name[1024];
-    int dev;
+    FILE *f;
+    int dev, loaded;
 
     memset(t, 0, sizeof(*t));
     t->done = done;
@@ -1454,13 +1667,31 @@ static inline int pi_open(pi_tagger *t, const char *model, const char *csv, cons
             return -1;
         }
     }
+    t->nt0 = t->wv.nt;
+    if (prm->steal && !t->haspx) {
+        fprintf(stderr, "-s: tag stealing learns from PixAI, add -px\n");
+        return -1;
+    }
+    t->steal = prm->steal;
+    t->glean = prm->glean;
+    t->learn = t->steal | t->glean;
+    if (t->learn) { // stolen rows and user tags share the extra rows and the head file; either loads all of it
+        if (st_init(&t->st, &t->wv, &t->pv, prm->scap, prm->scats, prm->sfile, prm->char_thresh, prm->gen_thresh))
+            return -1;
+        f = prm->sfile ? fopen(prm->sfile, "rb") : NULL;
+        loaded = !st_load(&t->st, &t->wv, &t->pv, f);
+        if (tg_init(&t->tg, &t->st, &t->wv, &t->pv, prm->gk)) return -1;
+        if (loaded) tg_load(&t->tg, &t->st, &t->wv, f);
+        if (f) fclose(f);
+    }
     if (pi_scratch(t, prm)) return -1;
-    if (eva_open(&t->e, model, dev, t->pool, t->poolb)) return -1;
+    if (eva_open(&t->e, model, dev, t->pool, t->poolb, t->wv.nt - t->nt0)) return -1;
     if (t->e.nt != t->wv.nt) {
         fprintf(stderr, "%s has %u tags, %s has %u\n", model, t->e.nt, csv, t->wv.nt);
         return -1;
     }
     if (t->haspx && px_open(&t->p, prm->px, dev, t->ppool, t->ppoolb)) return -1;
+    t->hasnpu = prm->npu && !npu_open(&t->n, prm->npu, t->nt0);
     if (t->haspx && t->p.nt != t->pv.nt) {
         fprintf(stderr, "%s has %u tags, %s has %u\n", prm->px, t->p.nt, name, t->pv.nt);
         return -1;
@@ -1473,10 +1704,25 @@ static inline int pi_open(pi_tagger *t, const char *model, const char *csv, cons
 // batches just queue; once it is up, everything queued is submitted and one batch stays in flight while the next
 // fills. PixAI inputs are prepared into PI_PXS pinned slots and issued PX_NB at a time from the ready FIFO.
 #define PI_BUF(b) ((b) & (EVA_NBUF - 1))
+#ifdef PI_DETCHK // debug build: CRC32C of every wd input when queued and when its output lands
+static uint32_t pi_dcrc[EVA_NBUF][EVA_NB];
+static inline uint32_t pi_crc(const uint16_t *p)
+{
+    const uint64_t *q;
+    uint64_t c;
+    size_t i;
+
+    for (i = 0, c = 0, q = (const uint64_t *)p; i < EVA_IN / 4; i++) c = _mm_crc32_u64(c, q[i]);
+    return (uint32_t)c;
+}
+#define PI_DCRC(t) (pi_dcrc[PI_BUF((t)->batch)][(t)->fill] = pi_crc((t)->src[PI_BUF((t)->batch)][(t)->fill]))
+#else
+#define PI_DCRC(t) (void)0
+#endif
 // Next slot of the filling wd batch: input i of job q (already in the pool).
 #define PI_SLOT(t, q, i)                                                                \
     ((t)->own[PI_BUF((t)->batch)][(t)->fill] = (pi_owner){(uint16_t)(q), (uint16_t)(i)}, \
-     (t)->src[PI_BUF((t)->batch)][(t)->fill] = (t)->job[q].in + (size_t)(i) * EVA_IN)
+     (t)->src[PI_BUF((t)->batch)][(t)->fill] = (t)->job[q].in + (size_t)(i) * EVA_IN, PI_DCRC(t))
 #define PI_COMMIT(t) (++(t)->fill < EVA_NB ? 0 : pi_launch(t))
 #define PI_CHECK(t, q, jb)                                                              \
     do {                                                                                \
@@ -1484,16 +1730,17 @@ static inline int pi_open(pi_tagger *t, const char *model, const char *csv, cons
     } while (0)
 #define PI_ALL(n) ((1u << (n)) - 1)
 
-// Free the source pixels once no PixAI input can still be prepared from them: nothing left to prepare, no PixAI
-// crop gate pending, and no stage-2 decision that could escalate a D job.
+// Free the pyramid once no input can still be prepared from it: no PixAI input or deferred wd crop left to prepare,
+// no PixAI crop gate pending, and no wd full-pass decision pending that could still want crops (D's gate, stage-2
+// escalation).
 static inline void pi_release(pi_tagger *t, pi_job *jb)
 {
-    if (!jb->rgba || jb->prep || (jb->wait & 2) || ((jb->wait & 1) && t->haspx && jb->route == PI_D)) return;
-    free(jb->rgba);
-    jb->rgba = NULL;
+    if (!jb->pyr.lv[0] || jb->prep || jb->wprep || (jb->wait & 2)
+        || ((jb->wait & 1) && jb->route == PI_D && (t->haspx || jb->res.nmvi))) return;
+    pi_pyr_free(&jb->pyr);
 }
 
-// Stage 2 sent a D job elsewhere; its wd full pass is done, its wd crops are already in the pool.
+// Stage 2 sent a D job elsewhere; its wd full pass is done, its wd crops (A) are prepared when pi_pump queues them.
 static inline void pi_escalate(pi_tagger *t, uint32_t q, uint32_t r)
 {
     pi_job *jb;
@@ -1506,6 +1753,7 @@ static inline void pi_escalate(pi_tagger *t, uint32_t q, uint32_t r)
         jb->prep |= 1;
         jb->res.runm = all;
         jb->pend += jb->res.nmvi;
+        jb->wprep = all != 0;
         if (all) t->defer[t->ndefer++] = q;
     } else if (r == PI_B) {
         jb->prep |= all << 1;
@@ -1521,8 +1769,8 @@ static inline int pi_wd_idle(pi_tagger *t)
     return t->sub == t->col || eva_query(&t->e, PI_BUF(t->sub - 1));
 }
 
-// Prepare one PixAI input into a free slot: from the job whose composite is already in rgbx if it has work, else
-// an exploring job (its labels train the router), else the lowest. Composites again when the owner changes.
+// Prepare one PixAI input into a free slot: an exploring job first (its labels train the router), else the lowest.
+// Every job keeps its own pyramid, so switching jobs costs nothing.
 static inline int pi_pxprep(pi_tagger *t)
 {
     pi_job *jb;
@@ -1533,28 +1781,20 @@ static inline int pi_pxprep(pi_tagger *t)
     for (q = 0, best = PI_JOBS; q < PI_JOBS; q++) {
         jb = &t->job[q];
         if (jb->state != PI_LIVE || !jb->prep) continue;
-        if (q == t->owner) {
-            best = q;
-            break;
-        }
         best = best == PI_JOBS || (jb->explore && !t->job[best].explore) ? q : best;
     }
     if (best == PI_JOBS) return 0;
     jb = &t->job[best];
-    if (t->owner != best) {
-        pi_load(t, jb->rgba, jb->w, jb->h, jb->istride, jb->alpha);
-        t->owner = best;
-    }
     i = (uint32_t)__builtin_ctz(jb->prep);
     slot = (uint32_t)__builtin_ctz(t->pfree);
     t->pfree &= t->pfree - 1;
     ts = t->prm.ts;
     if (!i) {
-        pi_prep_px(t, 0, 0, jb->w, jb->h, t->ppool + (size_t)slot * PX_IN);
+        pi_prep_px(t, &jb->pyr, 0, 0, jb->w, jb->h, t->ppool + (size_t)slot * PX_IN);
     } else {
         m = &jb->res.mvi[i - 1];
         PI_CROPGEO(m, ts, jb->w, jb->h, x0, y0, cw, ch);
-        pi_prep_px(t, x0, y0, cw, ch, t->ppool + (size_t)slot * PX_IN);
+        pi_prep_px(t, &jb->pyr, x0, y0, cw, ch, t->ppool + (size_t)slot * PX_IN);
     }
     jb->prep &= jb->prep - 1;
     jb->pend++;
@@ -1619,19 +1859,23 @@ static inline int pi_pxgather(pi_tagger *t, uint32_t block)
     return 1;
 }
 
-// One unit of heavy-side work, never blocking: collect a finished PixAI batch, else prepare an input, else issue.
+static inline int pi_npu_gather(pi_tagger *t, uint32_t block);
+
+// One unit of side work, never blocking: land finished NPU passes, collect a finished PixAI batch, else prepare an
+// input, else issue.
 static inline int pi_step(pi_tagger *t)
 {
     int r;
 
+    if ((r = pi_npu_gather(t, 0))) return r;
     if (!t->haspx) return 0;
     if ((r = pi_pxgather(t, 0))) return r;
     if ((r = pi_pxprep(t))) return r;
     return pi_pxsubmit(t, 0);
 }
 
-// Heavy work when nothing light is left: prepare everything there is room for, issue (partial batches too), and
-// block for the oldest PixAI batch. 1 if anything moved.
+// Side work when nothing light is left: prepare everything there is room for, issue (partial batches too), block
+// for the oldest PixAI batch, then for an NPU pass. 1 if anything moved.
 static inline int pi_pxforce(pi_tagger *t)
 {
     int r, moved;
@@ -1640,7 +1884,8 @@ static inline int pi_pxforce(pi_tagger *t)
     if (r < 0 || (r = pi_pxsubmit(t, 1)) < 0) return -1;
     moved |= r;
     if ((r = pi_pxgather(t, 1)) < 0) return -1;
-    return moved | r;
+    moved |= r;
+    return moved | pi_npu_gather(t, !moved);
 }
 
 // Wait for wd batch b, doing heavy-side work while the GPU is busy with it.
@@ -1656,52 +1901,110 @@ static inline const float *pi_wd_wait(pi_tagger *t, uint32_t b)
     return eva_wait(&t->e, PI_BUF(b));
 }
 
-// wd batch b is done: scatter outputs to their jobs. A job whose wd full pass just landed takes its decisions: stage
-// 2 of the router (D may escalate), the exact wd crop gate (deferred crops), stage-2 features for an exploring job.
+// One wd output (input idx of job q, from either engine) lands. A job whose wd full pass just landed takes its
+// decisions: stage 2 of the router (D may escalate), the exact wd crop gate (deferred crops), stage-2 features for
+// an exploring job. pn: the GPU pass's head input (-s / -g); NULL from the NPU, whose head has only the file's rows.
+static inline void pi_land(pi_tagger *t, uint32_t q, uint32_t idx, const float *src, const uint16_t *pn)
+{
+    pi_job *jb;
+    uint32_t x[PI_F2];
+    uint32_t nt, matter, r, router;
+
+    jb = &t->job[q];
+    nt = t->wv.nt;
+    router = t->haspx && t->prm.route < 0;
+    memcpy(jb->out + (size_t)idx * nt, src, (pn || !t->learn ? nt : t->nt0) * sizeof(float));
+    if (t->learn && pn) {
+        memcpy(jb->pn + (size_t)idx * EVA_D, pn, EVA_D * 2);
+        jb->pnv |= 1u << idx;
+        if (!idx) st_mean(&t->st, pn);
+#ifdef TG_DUMP // every GPU pass's head input: u32 name length, name, u32 input index, u16 x[EVA_D]
+        {
+            static FILE *df;
+            uint32_t dn;
+
+            df = df ? df : fopen(TG_DUMP, "wb");
+            dn = (uint32_t)strlen((const char *)jb->user);
+            fwrite(&dn, 4, 1, df);
+            fwrite(jb->user, 1, dn, df);
+            fwrite(&idx, 4, 1, df);
+            fwrite(pn, 2, EVA_D, df);
+            fflush(df);
+        }
+#endif
+        if (!idx && !jb->side && t->glean) tg_observe(&t->tg, t->st.mu, t->st.nmu, pn);
+        if (!idx) tg_score(&t->tg, pn, jb->out); // user tags: whole image only (crops keep their ~0 GPU rows)
+    } else if (t->learn) {
+        memset(jb->out + (size_t)idx * nt + t->nt0, 0, (nt - t->nt0) * sizeof(float));
+    }
+    jb->pend--;
+    if (!idx && (jb->wait & 1)) {
+        jb->wait &= ~1u;
+        matter = jb->res.nmvi && pi_crops_matter(t, &t->wv, jb->out, &jb->res);
+        if (router) {
+            pi_feat2(t, jb, matter, x);
+            hp_index(&t->r2, x, jb->i2);
+        }
+        if (jb->route == PI_D) {
+            r = router && !jb->explore ? pi_pick(hp_ge(hp_sum(&t->r2, jb->i2), t->c2)) : PI_D;
+            if (r != PI_D) {
+                pi_escalate(t, q, r);
+            } else if (matter) {
+                jb->res.runm = PI_ALL(jb->res.nmvi);
+                jb->pend += jb->res.nmvi;
+                jb->wprep = 1;
+                t->defer[t->ndefer++] = q;
+            }
+        }
+        pi_release(t, jb);
+    }
+    PI_CHECK(t, q, jb);
+}
+
+// wd batch b is done: scatter outputs to their jobs.
 static inline int pi_gather(pi_tagger *t, uint32_t b)
 {
     const float *out;
     pi_owner *o;
-    pi_job *jb;
-    uint32_t x[PI_F2];
-    uint32_t s, n, nt, matter, r, router;
+    uint32_t s, n, nt;
 
     if (!(out = pi_wd_wait(t, b))) return -1;
     nt = t->wv.nt;
     n = t->cnt[PI_BUF(b)];
-    router = t->haspx && t->prm.route < 0;
     for (s = 0; s < n; s++) {
         o = &t->own[PI_BUF(b)][s];
-        jb = &t->job[o->job];
-        memcpy(jb->out + (size_t)o->idx * nt, out + (size_t)s * nt, nt * sizeof(float));
-        jb->pend--;
-        if (!o->idx && (jb->wait & 1)) {
-            jb->wait &= ~1u;
-            matter = jb->res.nmvi && pi_crops_matter(t, &t->wv, jb->out, &jb->res);
-            if (router) {
-                pi_feat2(t, jb, matter, x);
-                hp_index(&t->r2, x, jb->i2);
-            }
-            if (jb->route == PI_D) {
-                r = router && !jb->explore ? pi_pick(hp_ge(hp_sum(&t->r2, jb->i2), t->c2)) : PI_D;
-                if (r != PI_D) {
-                    pi_escalate(t, o->job, r);
-                } else if (matter) {
-                    jb->res.runm = PI_ALL(jb->res.nmvi);
-                    jb->pend += jb->res.nmvi;
-                    t->defer[t->ndefer++] = o->job;
-                }
-            }
-            pi_release(t, jb);
-        }
-        PI_CHECK(t, o->job, jb);
+#ifdef PI_DETCHK
+        if (pi_crc(t->src[PI_BUF(b)][s]) != pi_dcrc[PI_BUF(b)][s])
+            fprintf(stderr, "detchk: %s input %u changed between queue and land (batch %u slot %u of %u)\n",
+                    (const char *)t->job[o->job].user, o->idx, b, s, n);
+        if (!o->idx) fprintf(stderr, "detcrc %08x %s\n", pi_dcrc[PI_BUF(b)][s], (const char *)t->job[o->job].user);
+#endif
+        pi_land(t, o->job, o->idx, out + (size_t)s * nt,
+                t->e.hpn[PI_BUF(b)] ? t->e.hpn[PI_BUF(b)] + (size_t)s * EVA_D : NULL);
     }
     return 0;
 }
 
-// Submit every queued wd batch (blocks only if the engine is not up yet).
+// Finished NPU passes land like GPU ones (block: wait for the first busy slot). 1 if any landed.
+static inline int pi_npu_gather(pi_tagger *t, uint32_t block)
+{
+    uint32_t s, moved;
+
+    if (!t->hasnpu || !t->n.busy) return 0;
+    for (s = 0, moved = 0; s < NPU_NBUF; s++) {
+        if (!npu_done(&t->n, s, block && !moved)) continue;
+        pi_land(t, t->nown[s], 0, npu_out(&t->n, s), NULL);
+        npu_release(&t->n, s);
+        t->nnpu++;
+        moved = 1;
+    }
+    return (int)moved;
+}
+
+// Submit every queued wd batch (blocks only if the engine is not up yet). Stolen head rows that moved go first.
 static inline int pi_submit(pi_tagger *t)
 {
+    if (t->sub != t->batch && t->st.nd && st_flush(&t->st, &t->e)) return -1;
     for (; t->sub != t->batch; t->sub++)
         if (eva_submit(&t->e, PI_BUF(t->sub), t->src[PI_BUF(t->sub)], t->cnt[PI_BUF(t->sub)])) return -1;
     return 0;
@@ -1732,16 +2035,78 @@ static inline int pi_settle(pi_tagger *t)
     return 0;
 }
 
+// -s: a finished job that ran both models teaches wd's head (steal.h). Explored: wd full vs PixAI full, and every
+// crop both models ran vs its PixAI twin; px-crops: wd full vs PixAI's crop maxima (t->sc[1], left there by
+// pi_finish), positives only; px-full: PixAI full vs wd's crops (multiple-instance).
+static inline void pi_steal(pi_tagger *t, pi_job *jb)
+{
+    st_learn *L;
+    uint32_t nt, pt, both, i, k, m;
+    int r;
+
+    L = &t->st;
+    nt = t->wv.nt;
+    pt = t->pv.nt;
+    r = 0;
+    both = jb->pnv >> 1 & jb->res.runm;
+    L->nev += jb->route == PI_X || jb->route == PI_B || (jb->route == PI_A && both);
+    if (jb->route == PI_X) {
+        if (jb->pnv & 1) r |= st_teach(L, &t->e, &t->wv, &t->pv, jb->pn, jb->out, jb->pout, 3, ST_FULL);
+        for (both &= jb->res.prun, i = 0; both >> i; i++)
+            if (both >> i & 1)
+                r |= st_teach(L, &t->e, &t->wv, &t->pv, jb->pn + (size_t)(1 + i) * EVA_D, jb->out + (size_t)(1 + i) * nt,
+                              jb->pout + (size_t)(1 + i) * pt, 3, ST_CROP);
+    } else if (jb->route == PI_B && (jb->pnv & 1)) {
+        r |= st_teach(L, &t->e, &t->wv, &t->pv, jb->pn, jb->out, t->sc[1], 1, ST_FULL);
+    } else if (jb->route == PI_A && both) {
+        ST_SCAN(pt, jb->pout, L->phi, _CMP_GE_OQ, i, k, m,
+                r |= st_milpos(L, &t->e, k, jb->pn + EVA_D, jb->out + nt, nt, both, jb->pout[k]));
+        for (i = 0; both >> i; i++)
+            if (both >> i & 1)
+                r |= st_teach(L, &t->e, &t->wv, &t->pv, jb->pn + (size_t)(1 + i) * EVA_D, jb->out + (size_t)(1 + i) * nt,
+                              jb->pout, 2, ST_CROP);
+    }
+    t->err |= r != 0;
+}
+
+// User tags over threshold in score (wd's whole-image rows); names already emitted are skipped.
+static inline void pi_emit_user(pi_tagger *t, const float *score, pi_result *res)
+{
+    uint32_t u, j;
+
+    for (u = 0; u < t->tg.nu; u++) {
+        j = t->tg.tag[u]->row;
+        if (score[j] >= t->wv.thr[j] && (res->n >= PI_OH / 2 || pi_hput(t->oh, t->wv.hash[j])))
+            t->otag[res->n++] = (pi_tag){t->wv.name[j], score[j]};
+    }
+}
+
+// -g: an image with a sidecar teaches before it is reported (tagg.h), then its whole-image pass is rescored for the
+// user tags, so its own line carries what it taught.
+static inline void pi_side(pi_tagger *t, pi_job *jb)
+{
+    if (jb->pnv & 1) {
+        t->err |= tg_side(&t->tg, &t->st, &t->e, &t->wv, &t->pv, jb->pn, jb->out, jb->side, jb->nside) != 0;
+        tg_score(&t->tg, jb->pn, jb->out);
+    }
+    free(jb->side);
+    jb->side = NULL;
+}
+
 // A job has everything: combine per route, train the router on an exploring job, report, free.
 static inline void pi_finish(pi_tagger *t, uint32_t q)
 {
     pi_job *jb;
     pi_result *r;
-    const float *ws, *ps;
+    const float *ws, *ps, *us;
+#ifdef TG_DEBUG
+    uint32_t j;
+#endif
 
     jb = &t->job[q];
     r = &jb->res;
-    ws = ps = NULL;
+    ws = ps = us = NULL;
+    if (jb->side) pi_side(t, jb);
     switch (jb->route) {
     case PI_D:
         pi_combine(t, &t->wv, jb->out, r, r->runm, t->sc[0]);
@@ -1764,8 +2129,9 @@ static inline void pi_finish(pi_tagger *t, uint32_t q)
         pi_combine(t, &t->pv, jb->pout, r, r->prun, t->sc[1]);
         ps = t->sc[1];
         r->rating = pi_rating(&t->pv, jb->pout);
-        if (jb->route == PI_X) pi_learn(t, jb); // reads sc[1] (route C), overwrites sc[0], sc[2], sc[3]
+        if (jb->route == PI_X && t->prm.route < 0) pi_learn(t, jb); // reads sc[1], overwrites sc[0], sc[2], sc[3]
     }
+    us = t->tg.nu && (jb->pnv & 1) ? jb->out : NULL; // user tags: from wd's whole-image pass, on every route
     t->nroute[jb->route]++;
     r->route = jb->route;
     r->ncrop = (uint32_t)__builtin_popcount(r->runm) + (uint32_t)__builtin_popcount(r->prun);
@@ -1774,29 +2140,42 @@ static inline void pi_finish(pi_tagger *t, uint32_t q)
     memset(t->oh, 0, PI_OH * sizeof(uint32_t));
     if (ps) pi_emit(t, &t->pv, ps, r);
     if (ws) pi_emit(t, &t->wv, ws, r);
+    if (us) pi_emit_user(t, us, r);
+#ifdef TG_DEBUG // every user tag's full-image score
+    for (j = 0; (jb->pnv & 1) && j < t->tg.nu; j++)
+        fprintf(stderr, "tgdbg %s %s %.4f\n", (const char *)jb->user, t->wv.name[t->tg.tag[j]->row],
+                jb->out[t->tg.tag[j]->row]);
+#endif
     t->done(t, jb->user, r);
-    free(jb->rgba);
-    jb->rgba = NULL;
+    if (t->steal) pi_steal(t, jb);
+    pi_pyr_free(&jb->pyr);
     jb->state = PI_FREE;
     t->jfree |= 1u << q;
     t->live--;
-    t->owner = t->owner == q ? PI_JOBS : t->owner;
 }
 
-// Queue deferred wd crops, then retire finished jobs.
+// Prepare and queue deferred wd crops (only the ones a gate let through ever get resampled), then retire finished
+// jobs.
 static inline int pi_pump(pi_tagger *t)
 {
     pi_job *jb;
-    uint32_t q, i;
+    pi_rect *m;
+    uint32_t q, i, ts, x0, y0, cw, ch;
 
+    ts = t->prm.ts;
     while (t->ndefer) {
         q = t->defer[--t->ndefer];
         jb = &t->job[q];
         for (i = 0; i < jb->res.nmvi; i++) {
             if (!(jb->res.runm >> i & 1)) continue;
+            m = &jb->res.mvi[i];
+            PI_CROPGEO(m, ts, jb->w, jb->h, x0, y0, cw, ch);
+            pi_prep(t, &jb->pyr, x0, y0, cw, ch, jb->in + (size_t)(i + 1) * EVA_IN);
             PI_SLOT(t, q, i + 1);
             if (PI_COMMIT(t)) return -1;
         }
+        jb->wprep = 0;
+        pi_release(t, jb);
     }
     while (t->nfin) pi_finish(t, t->fin[--t->nfin]);
     return t->err ? -1 : 0;
@@ -1819,15 +2198,15 @@ static inline int pi_wait_job(pi_tagger *t)
     return 0;
 }
 
-// Tag one decoded image (RGBA, in_stride bytes per row, malloc'd: the tagger owns and frees it). alpha: 1 if the
-// source had an alpha channel. The route is chosen now; wd inputs are prepared and queued now (a D job's crops are
-// prepared now and queued only if the full pass says they matter); PixAI inputs are prepared in GPU-wait time.
-static inline int pi_push(pi_tagger *t, uint8_t *rgba, uint32_t w, uint32_t h, size_t in_stride, uint32_t alpha,
-                          void *user)
+// Tag one image ingested by pi_ingest; the tagger takes its pyramid (im->p.lv[0] is NULL afterwards). The route is
+// chosen now; the wd full image (and A / X crops) are prepared and queued now; a D job's crops are prepared only if
+// its full pass says they matter; PixAI inputs are prepared in GPU-wait time.
+static inline int pi_push(pi_tagger *t, pi_img *im, void *user)
 {
     pi_job *jb;
     pi_rect *m;
-    uint32_t q, i, ts, all, wfull, wcrop, x0, y0, cw, ch;
+    uint32_t q, i, ts, all, wfull, wcrop, x0, y0, cw, ch, w, h;
+    int s;
 
     while (!t->jfree)
         if (pi_wait_job(t)) return -1;
@@ -1836,40 +2215,59 @@ static inline int pi_push(pi_tagger *t, uint8_t *rgba, uint32_t w, uint32_t h, s
     t->live++;
     jb = &t->job[q];
     ts = t->prm.ts;
-    pi_load(t, rgba, w, h, in_stride, alpha);
-    t->owner = q;
-    jb->rgba = rgba;
-    jb->istride = in_stride;
-    jb->w = w;
-    jb->h = h;
-    jb->alpha = alpha;
+    jb->pyr = im->p;
+    im->p.lv[0] = NULL;
+    im->p.nlv = 0;
+    jb->w = w = jb->pyr.lw[0];
+    jb->h = h = jb->pyr.lh[0];
+    jb->alpha = im->alpha;
     jb->user = user;
     jb->state = PI_LIVE;
     jb->explore = 0;
-    jb->res.nmvi = pi_find_mvis(t, w, h, &jb->res);
+    jb->wprep = 0;
+    jb->pnv = 0;
+    jb->side = t->glean ? im->side : NULL;
+    jb->nside = im->nside;
+    if (!t->glean) free(im->side);
+    im->side = NULL;
+    jb->res.nmvi = pi_find_mvis(t, im, &jb->res);
     jb->res.runm = jb->res.prun = 0;
     all = PI_ALL(jb->res.nmvi);
     jb->route = pi_route1(t, jb);
-    wfull = jb->route == PI_D || jb->route == PI_B || jb->route == PI_X;
+    if (jb->side) { // a sidecar image runs everything on the GPU: wd's embedding teaches the user tags, PixAI steals
+        jb->route = t->haspx ? PI_X : PI_D;
+        jb->explore = 1;
+    }
+    // -g, or user tags loaded: every route runs wd's whole-image GPU pass. User tags are scored from it, and it feeds
+    // the running mean and the background sample sidecar learning needs (a PixAI-only run would otherwise learn
+    // nothing from its sidecars)
+    wfull = jb->route == PI_D || jb->route == PI_B || jb->route == PI_X || t->glean || t->tg.nu;
     wcrop = jb->route == PI_A || jb->route == PI_X; // all wd crops now; D's wait for the gate
     jb->prep = jb->route == PI_A || jb->route == PI_C ? 1 : jb->route == PI_B ? all << 1 : jb->route == PI_X ? 1 | all << 1 : 0;
     jb->wait = jb->route == PI_D || jb->route == PI_X ? 1 : jb->route == PI_C && all ? 2 : 0;
     jb->res.runm = wcrop ? all : 0;
     jb->res.prun = jb->route == PI_B || jb->route == PI_X ? all : 0;
     jb->pend = wfull + (wcrop ? jb->res.nmvi : 0);
-    if (jb->route == PI_D || wcrop)
-        for (i = 0; i < jb->res.nmvi; i++) {
-            m = &jb->res.mvi[i];
-            PI_CROPGEO(m, ts, w, h, x0, y0, cw, ch);
-            pi_prep(t, x0, y0, cw, ch, jb->in + (size_t)(i + 1) * EVA_IN);
-        }
-    if (wfull) pi_prep(t, 0, 0, w, h, jb->in);
+    for (i = 0; wcrop && i < jb->res.nmvi; i++) {
+        m = &jb->res.mvi[i];
+        PI_CROPGEO(m, ts, w, h, x0, y0, cw, ch);
+        pi_prep(t, &jb->pyr, x0, y0, cw, ch, jb->in + (size_t)(i + 1) * EVA_IN);
+    }
+    if (wfull) pi_prep(t, &jb->pyr, 0, 0, w, h, jb->in);
     pi_release(t, jb);
     for (i = 0; wcrop && i < jb->res.nmvi; i++) {
         PI_SLOT(t, q, i + 1);
         if (PI_COMMIT(t)) return -1;
     }
-    if (wfull) {
+#ifdef PI_NPU_ALL // validation build: every wd full pass waits for an NPU slot
+    while (wfull && t->hasnpu && (t->n.boot || t->n.up) && npu_free(&t->n) < 0)
+        if (t->n.up && pi_npu_gather(t, 1) < 0) return -1;
+#endif
+    // a free NPU slot takes the full pass, unless user tags need its head input (the NPU has none)
+    if (wfull && t->hasnpu && !jb->side && !t->tg.nu && (s = npu_free(&t->n)) >= 0) {
+        if (npu_submit(&t->n, (uint32_t)s, jb->in)) return -1;
+        t->nown[s] = (uint16_t)q;
+    } else if (wfull) {
         PI_SLOT(t, q, 0);
         if (PI_COMMIT(t)) return -1;
     }
@@ -1895,26 +2293,27 @@ static inline int pi_drain(pi_tagger *t)
 
 static inline void pi_close(pi_tagger *t)
 {
-    uint32_t j, ne;
+    FILE *f;
+    uint32_t j;
 
-    if (t->haspx && t->prm.route < 0 && t->routed) {
-        ne = t->nroute[PI_X];
-        fprintf(stderr, "router: %u images, routes D %u A %u B %u C %u, explored %u", t->routed, t->nroute[PI_D],
-                t->nroute[PI_A], t->nroute[PI_B], t->nroute[PI_C], ne);
-        if (ne)
-            fprintf(stderr, "; explored agreeing with C: D %.1f%% A %.1f%% B %.1f%%; predicted right before learning:"
-                    " stage 1 %.1f/%.1f/%.1f%%, stage 2 %.1f/%.1f/%.1f%%",
-                    100.0 * t->nok[0] / ne, 100.0 * t->nok[1] / ne, 100.0 * t->nok[2] / ne,
-                    100.0 * t->hit1[0] / ne, 100.0 * t->hit1[1] / ne, 100.0 * t->hit1[2] / ne,
-                    100.0 * t->hit2[0] / ne, 100.0 * t->hit2[1] / ne, 100.0 * t->hit2[2] / ne);
-        fputc('\n', stderr);
-    }
     eva_close(&t->e);
     if (t->haspx) px_close(&t->p);
+    if (t->hasnpu) npu_close(&t->n);
     for (j = 0; j < PI_JOBS; j++) {
         free(t->job[j].out);
         free(t->job[j].pout);
-        free(t->job[j].rgba);
+        free(t->job[j].pn);
+        free(t->job[j].side);
+        pi_pyr_free(&t->job[j].pyr);
+    }
+    if (t->learn) {
+        if (t->st.file && (f = fopen(t->st.file, "wb"))) {
+            st_save(&t->st, &t->wv, f);
+            tg_save(&t->tg, &t->wv, f);
+            fclose(f);
+        }
+        tg_free(&t->tg, &t->wv);
+        st_free(&t->st);
     }
     for (j = 0; j < 4; j++) _mm_free(t->sc[j]);
     hp_free(&t->r1);
@@ -1922,10 +2321,7 @@ static inline void pi_close(pi_tagger *t)
     _mm_free(t->pool);
     _mm_free(t->ppool);
     _mm_free(t->band);
-    _mm_free(t->x);
-    _mm_free(t->plan);
     _mm_free(t->sel);
-    _mm_free(t->rgbx);
     _mm_free(t->tmp);
     _mm_free(t->wx);
     _mm_free(t->wy);

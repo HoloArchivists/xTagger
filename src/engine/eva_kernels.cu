@@ -13,6 +13,7 @@
 #define NKT  17      // ceil(T / 64) key tiles
 #define SWT  352     // k_swiglu_ln threads: 11 warps, 342 active (HIDP / 8)
 #define TP   1088    // keys padded to NKT * 64
+#define FC1_GM 8     // k_fc1 raster group: row tiles walked together
 
 #include "kern_common.cuh"
 
@@ -57,11 +58,14 @@ extern "C" __global__ void __launch_bounds__(128, 2) k_qkv(const unsigned char *
     hh = (blockIdx.x & 7) * 2;
     gemm8<128, D>(x, w + (size_t)blockIdx.x * 128 * D, m0, rows, (unsigned)__cvta_generic_to_shared(sm), acc);
     sc = alpha * (p == 0 ? cq : p == 1 ? ck : cv);
+#pragma unroll
     for (mt = 0; mt < 2; mt++)
+#pragma unroll
         for (i = 0; i < 2; i++) {
             r = warp * 32 + mt * 16 + (lane >> 2) + 8 * i;
             m = m0 + r;
             t = m % T;
+#pragma unroll
             for (nt = 0; nt < 16; nt++) {
                 f0 = acc[mt][nt][2 * i] * sc;
                 f1 = acc[mt][nt][2 * i + 1] * sc;
@@ -117,6 +121,46 @@ extern "C" __global__ void __launch_bounds__(128, 4) k_flash(const unsigned char
     flash8<T>(q8, k8, v8, out, sinv, vo);
 }
 
+// Patch embedding (fp16 on gemm8): x rows 1..1024 of every image = in . pe^T; k_embed adds pos / cls after.
+// Grid (1024 / 128, B * 1024 / 128).
+extern "C" __global__ void __launch_bounds__(128, 2) k_pe(const __half *__restrict__ in, const __half *__restrict__ pe,
+                                                         res_t *__restrict__ x, unsigned rows)
+{
+    patch_gemm<1>(in, pe, x, rows);
+}
+
+// Attention out-projection: x [rows][1024] += alpha a W^T (a: flash output E4M3, alpha = weight x activation dequant).
+// Grid (1024 / 128, ceil(rows / 128)).
+extern "C" __global__ void __launch_bounds__(128, 2) k_oproj(const unsigned char *__restrict__ a,
+                                                            const unsigned char *__restrict__ w, res_t *__restrict__ x,
+                                                            float alpha, unsigned rows)
+{
+    __shared__ __align__(128) unsigned char sm[GS * 256 * 64];
+    __half2 *xp;
+    float2 xf;
+    float acc[2][16][4];
+    unsigned lane, warp, m0, mt, nt, i, m, n;
+
+    lane = threadIdx.x & 31;
+    warp = threadIdx.x >> 5;
+    m0 = blockIdx.y * 128;
+    gemm8<128, D>(a, w + (size_t)blockIdx.x * 128 * D, m0, rows, (unsigned)__cvta_generic_to_shared(sm), acc);
+#pragma unroll
+    for (mt = 0; mt < 2; mt++)
+#pragma unroll
+        for (i = 0; i < 2; i++) {
+            m = m0 + warp * 32 + mt * 16 + (lane >> 2) + 8 * i;
+            if (m >= rows) continue;
+#pragma unroll
+            for (nt = 0; nt < 16; nt++) {
+                n = blockIdx.x * 128 + 8 * nt + 2 * (lane & 3);
+                xp = (__half2 *)(x + (size_t)m * D + n);
+                xf = __half22float2(*xp);
+                *xp = __floats2half2_rn(fmaf(alpha, acc[mt][nt][2 * i], xf.x), fmaf(alpha, acc[mt][nt][2 * i + 1], xf.y));
+            }
+        }
+}
+
 #else
 // ---- fp16 attention (calibration engine) ----
 
@@ -158,11 +202,12 @@ extern "C" __global__ void __launch_bounds__(128) k_flash(const __half *__restri
 // a smoothing s~ moved from h into W~'s columns). So h is quantized raw: k_fc1 writes h / s~ as E4M3 plus each row's
 // sum and sum of squares; k_fc2 applies mean / rstd per row in its epilogue. No LN pass, no fp16 intermediate.
 //
-// k_fc1: h8 [M][HIDP] = E4M3(rs * silu(g) * x), (g | x) = alpha * X W12^T, stat [M][2] += (sum h, sum h^2).
-// W12 rows are g / x interleaved in 16-unit chunks, so a 96-column block tile holds g and x of 48 whole units and
-// every lane's accumulators pair up g (n-tile 4c + a) with x (n-tile 4c + 2 + a) of the same unit. rs = per-unit
-// quant multiplier (448 / amax over 1 / s~). stat must be zero on entry. Grid (ceil(rows / 128), 2 HIDP / 96): row tile fastest, so the blocks in flight
-// add their row sums to different rows (same-address atomics serialize in L2).
+// k_fc1: h8 [M][HIDP] = E4M3(rs * silu(g) * x), (g | x) = alpha * X W12^T, stat [NCT][rows] = (sum h, sum h^2) over
+// the column tile's 48 units. W12 rows are g / x interleaved in 16-unit chunks, so a 96-column block tile holds g
+// and x of 48 whole units and every lane's accumulators pair up g (n-tile 4c + a) with x (n-tile 4c + 2 + a) of the
+// same unit. rs = per-unit quant multiplier (448 / amax over 1 / s~). Grid (ceil(rows / 128), NCT). Every (row,
+// column tile) partial has exactly one writer and k_fc2 sums them in a fixed order: no atomics, no clearing, and
+// the result is bit-identical run to run (float atomics added the 57 partials in arrival order).
 extern "C" __global__ void __launch_bounds__(128, 2) k_fc1(const unsigned char *__restrict__ x,
                                                           const unsigned char *__restrict__ w,
                                                           unsigned char *__restrict__ h8, float *__restrict__ stat,
@@ -170,24 +215,39 @@ extern "C" __global__ void __launch_bounds__(128, 2) k_fc1(const unsigned char *
 {
     __shared__ __align__(128) unsigned char sm[GS * (128 + 96) * 64];
     float acc[2][12][4], ru[3][2][2], g0, g1, x0, x1, s, q;
-    unsigned tid, lane, warp, m0, mt, c, kk, i, r, row;
+    unsigned tid, lane, warp, m0, mt, c, kk, i, r, row, lin, grp, gm, rem, ct;
 
     tid = threadIdx.x;
     lane = tid & 31;
     warp = tid >> 5;
-    m0 = blockIdx.x * 128;
-    gemm8<96, D>(x, w + (size_t)blockIdx.y * 96 * D, m0, rows, (unsigned)__cvta_generic_to_shared(sm), acc);
+    // Grouped raster: launch order walks FC1_GM row tiles x every column tile, so the ~32 resident blocks share
+    // a few X row tiles and W column tiles in L2 instead of streaming all of X once per column tile. Each row's
+    // stat still gets few concurrent adders (FC1_GM rows fastest).
+    lin = blockIdx.y * gridDim.x + blockIdx.x;
+    grp = lin / (FC1_GM * gridDim.y);
+    rem = lin - grp * FC1_GM * gridDim.y;
+    gm = gridDim.x - grp * FC1_GM < FC1_GM ? gridDim.x - grp * FC1_GM : FC1_GM;
+    m0 = (grp * FC1_GM + rem % gm) * 128;
+    ct = rem / gm;
+    gemm8<96, D>(x, w + (size_t)ct * 96 * D, m0, rows, (unsigned)__cvta_generic_to_shared(sm), acc);
+#pragma unroll
     for (c = 0; c < 3; c++)
+#pragma unroll
         for (kk = 0; kk < 2; kk++) {
-            ru[c][kk][0] = rs[blockIdx.y * 48 + 16 * c + 8 * kk + 2 * (lane & 3)];
-            ru[c][kk][1] = rs[blockIdx.y * 48 + 16 * c + 8 * kk + 2 * (lane & 3) + 1];
+            ru[c][kk][0] = rs[ct * 48 + 16 * c + 8 * kk + 2 * (lane & 3)];
+            ru[c][kk][1] = rs[ct * 48 + 16 * c + 8 * kk + 2 * (lane & 3) + 1];
         }
-    // unit 16c + 8kk + 2(lane & 3) + e of chunk c: g in n-tile 4c + kk, x in 4c + 2 + kk
+    // unit 16c + 8kk + 2(lane & 3) + e of chunk c: g in n-tile 4c + kk, x in 4c + 2 + kk; every index is constant
+    // after unrolling, so acc never leaves registers
+#pragma unroll
     for (mt = 0; mt < 2; mt++)
+#pragma unroll
         for (i = 0; i < 2; i++) {
             r = warp * 32 + mt * 16 + (lane >> 2) + 8 * i;
             s = q = 0.f;
+#pragma unroll
             for (c = 0; c < 3; c++)
+#pragma unroll
                 for (kk = 0; kk < 2; kk++) {
                     g0 = acc[mt][4 * c + kk][2 * i] * alpha;
                     g1 = acc[mt][4 * c + kk][2 * i + 1] * alpha;
@@ -204,23 +264,25 @@ extern "C" __global__ void __launch_bounds__(128, 2) k_fc1(const unsigned char *
             s += __shfl_xor_sync(0xffffffffu, s, 2);
             q += __shfl_xor_sync(0xffffffffu, q, 1);
             q += __shfl_xor_sync(0xffffffffu, q, 2);
-            if (!(lane & 3) && m0 + r < rows) {
-                atomicAdd(stat + 2 * (m0 + r), s);
-                atomicAdd(stat + 2 * (m0 + r) + 1, q);
-            }
+            if (!(lane & 3) && m0 + r < rows) *(float2 *)(stat + 2 * ((size_t)ct * rows + m0 + r)) = make_float2(s, q);
         }
     __syncthreads();
+    // h8 (22 MB a layer, read once by fc2) leaves evict-first: it must not push X and W out of L2
+#pragma unroll
     for (i = 0; i < 3; i++) {
         r = tid + 128 * i;
         row = r / 3;
         c = r - row * 3;
         if (m0 + row < rows)
-            *(uint4 *)(h8 + (size_t)(m0 + row) * HIDP + blockIdx.y * 48 + 16 * c) = *(const uint4 *)(sm + row * 48 + 16 * c);
+            __stcs((uint4 *)(h8 + (size_t)(m0 + row) * HIDP + ct * 48 + 16 * c), *(const uint4 *)(sm + row * 48 + 16 * c));
     }
 }
 
 // k_fc2: x [M][1024] += rstd (alpha h8 W~^T - mean c) + d, mean / rstd from k_fc1's row sums over the 2730 units
-// (pad units are exactly zero). Grid (1024 / 128, ceil(rows / 128)).
+// (pad units are exactly zero). Grid (1024 / 128, ceil(rows / 128)). After the GEMM each thread folds one row's NCT
+// partials in tile order (coalesced: consecutive threads, consecutive rows; the 3.7 MB of partials sit in L2) into
+// shared memory for the epilogue.
+#define NCT (2 * HIDP / 96)
 extern "C" __global__ void __launch_bounds__(128, 2) k_fc2(const unsigned char *__restrict__ h8,
                                                           const unsigned char *__restrict__ w, res_t *__restrict__ x,
                                                           const float *__restrict__ stat, const float *__restrict__ cn,
@@ -230,21 +292,35 @@ extern "C" __global__ void __launch_bounds__(128, 2) k_fc2(const unsigned char *
     __half2 *xp;
     float2 st, c2, d2, xf;
     float acc[2][16][4], mean, rstd, a, b;
-    unsigned lane, warp, m0, mt, nt, i, m, n;
+    unsigned lane, warp, m0, mt, nt, i, m, n, c;
 
     lane = threadIdx.x & 31;
     warp = threadIdx.x >> 5;
     m0 = blockIdx.y * 128;
     gemm8<128, HIDP>(h8, w + (size_t)blockIdx.x * 128 * HIDP, m0, rows, (unsigned)__cvta_generic_to_shared(sm), acc);
+    __syncthreads(); // the GEMM's last tile reads are done: sm is free
+    m = m0 + threadIdx.x;
+    st = make_float2(0.f, 0.f);
+#pragma unroll 8
+    for (c = 0; c < NCT && m < rows; c++) {
+        xf = *(const float2 *)(stat + 2 * ((size_t)c * rows + m));
+        st.x += xf.x;
+        st.y += xf.y;
+    }
+    ((float2 *)sm)[threadIdx.x] = st;
+    __syncthreads();
+#pragma unroll
     for (mt = 0; mt < 2; mt++)
+#pragma unroll
         for (i = 0; i < 2; i++) {
             m = m0 + warp * 32 + mt * 16 + (lane >> 2) + 8 * i;
             if (m >= rows) continue;
-            st = *(const float2 *)(stat + 2 * m);
+            st = ((const float2 *)sm)[m - m0];
             mean = st.x * (1.0f / HID);
             rstd = rsqrtf(st.y * (1.0f / HID) - mean * mean + EPS);
             a = alpha * rstd;
             b = -mean * rstd;
+#pragma unroll
             for (nt = 0; nt < 16; nt++) {
                 n = blockIdx.x * 128 + 8 * nt + 2 * (lane & 3);
                 c2 = *(const float2 *)(cn + n);

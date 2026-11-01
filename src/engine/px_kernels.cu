@@ -77,11 +77,14 @@ extern "C" __global__ void __launch_bounds__(128, 2) k_pqkv(const unsigned char 
     hh = (blockIdx.x & 7) * 2;
     gemm8<128, D>(x, w + (size_t)blockIdx.x * 128 * D, m0, rows, (unsigned)__cvta_generic_to_shared(sm), acc);
     sc = p == 0 ? cq : p == 1 ? ck : cv;
+#pragma unroll
     for (mt = 0; mt < 2; mt++)
+#pragma unroll
         for (i = 0; i < 2; i++) {
             r = warp * 32 + mt * 16 + (lane >> 2) + 8 * i;
             m = m0 + r;
             t = m % L;
+#pragma unroll
             for (nt = 0; nt < 16; nt++) {
                 d = 8 * (nt & 7) + 2 * (lane & 3);
                 bv = *(const float2 *)(bias + blockIdx.x * 128 + 8 * nt + 2 * (lane & 3));
@@ -127,6 +130,13 @@ extern "C" __global__ void __launch_bounds__(128, 2) k_pqkv(const unsigned char 
     }
 }
 
+// Patch embedding (fp16 on gemm8): x [rows][1024] = in . pe^T (window-major tokens, no cls); k_pembed follows.
+extern "C" __global__ void __launch_bounds__(128, 2) k_ppe(const __half *__restrict__ in, const __half *__restrict__ pe,
+                                                          res_t *__restrict__ x, unsigned rows)
+{
+    patch_gemm<0>(in, pe, x, rows);
+}
+
 extern "C" __global__ void __launch_bounds__(128, 4) k_pflash_w(const unsigned char *__restrict__ q8,
                                                                const unsigned char *__restrict__ k8,
                                                                const unsigned char *__restrict__ v8,
@@ -159,9 +169,12 @@ __device__ __forceinline__ void resgemm(const unsigned char *__restrict__ a, con
     warp = threadIdx.x >> 5;
     m0 = blockIdx.y * 128;
     gemm8<128, K>(a, w + (size_t)blockIdx.x * 128 * K, m0, rows, (unsigned)__cvta_generic_to_shared(sm), acc);
+#pragma unroll
     for (mt = 0; mt < 2; mt++)
+#pragma unroll
         for (i = 0; i < 2; i++) {
             m = m0 + warp * 32 + mt * 16 + (lane >> 2) + 8 * i;
+#pragma unroll
             for (nt = 0; nt < 16; nt++) {
                 n = blockIdx.x * 128 + 8 * nt + 2 * (lane & 3);
                 bv = *(const float2 *)(bias + n);
@@ -203,9 +216,12 @@ extern "C" __global__ void __launch_bounds__(128, 2) k_pfc1(const unsigned char 
     warp = tid >> 5;
     m0 = blockIdx.y * 128;
     gemm8<128, D>(x, w + (size_t)blockIdx.x * 128 * D, m0, rows, (unsigned)__cvta_generic_to_shared(sm), acc);
+#pragma unroll
     for (mt = 0; mt < 2; mt++)
+#pragma unroll
         for (i = 0; i < 2; i++) {
             r = warp * 32 + mt * 16 + (lane >> 2) + 8 * i;
+#pragma unroll
             for (nt = 0; nt < 16; nt++) {
                 n = blockIdx.x * 128 + 8 * nt + 2 * (lane & 3);
                 bv = *(const float2 *)(bias + n);
@@ -413,21 +429,68 @@ extern "C" __global__ void k_phsoft(const float *__restrict__ s, __half *__restr
     }
 }
 
-// o [B][1024] (fp16) = per head h: Wv[64h .. 64h + 63] . pooled[b][h] (pooled [B][16][1024] fp32 from cuBLAS P Y).
-// Value bias, out-proj and their biases live in the folded tag head. One block (256 threads) per (image, head).
-extern "C" __global__ void k_phv(const float *__restrict__ pooled, const __half *__restrict__ wv, __half *__restrict__ o)
+// Attention-pool sum: part [B][T / PCH][16][1024] = P [B][16][T] . y [B][T][1024] over one PCH-token chunk; k_phv
+// adds the chunks in order (bit-identical run to run; atomics added them in arrival order). Grid (B, T / PCH), 512
+// threads: one dim pair each with all 16 heads at once, so y is read exactly once; the chunk's P sits in shared
+// memory as [token][head] (4 float4 broadcasts per token).
+#define PCH 144
+extern "C" __global__ void __launch_bounds__(512) k_phpool(const __half *__restrict__ P, const __half *__restrict__ y,
+                                                          float *__restrict__ pooled)
+{
+    __shared__ __align__(16) float sp[PCH][16];
+    const __half2 *yr;
+    float *po;
+    float4 p0, p1, p2, p3;
+    float2 v;
+    float acc[16][2];
+    unsigned t0, t, h;
+
+    t0 = blockIdx.y * PCH;
+    for (t = threadIdx.x; t < PCH * 16; t += 512)
+        sp[t % PCH][t / PCH] = __half2float(P[((size_t)blockIdx.x * 16 + t / PCH) * T + t0 + t % PCH]);
+    __syncthreads();
+    yr = (const __half2 *)(y + ((size_t)blockIdx.x * T + t0) * D) + threadIdx.x;
+    for (h = 0; h < 16; h++) acc[h][0] = acc[h][1] = 0.f;
+    for (t = 0; t < PCH; t++) {
+        v = __half22float2(yr[(size_t)t * (D / 2)]);
+        p0 = ((const float4 *)sp[t])[0];
+        p1 = ((const float4 *)sp[t])[1];
+        p2 = ((const float4 *)sp[t])[2];
+        p3 = ((const float4 *)sp[t])[3];
+#define PH4(p, k)                                                                       \
+        acc[k][0] = fmaf((p).x, v.x, acc[k][0]); acc[k][1] = fmaf((p).x, v.y, acc[k][1]); \
+        acc[k + 1][0] = fmaf((p).y, v.x, acc[k + 1][0]); acc[k + 1][1] = fmaf((p).y, v.y, acc[k + 1][1]); \
+        acc[k + 2][0] = fmaf((p).z, v.x, acc[k + 2][0]); acc[k + 2][1] = fmaf((p).z, v.y, acc[k + 2][1]); \
+        acc[k + 3][0] = fmaf((p).w, v.x, acc[k + 3][0]); acc[k + 3][1] = fmaf((p).w, v.y, acc[k + 3][1]);
+        PH4(p0, 0) PH4(p1, 4) PH4(p2, 8) PH4(p3, 12)
+#undef PH4
+    }
+    po = pooled + ((size_t)blockIdx.x * gridDim.y + blockIdx.y) * 16 * D + 2 * threadIdx.x;
+    for (h = 0; h < 16; h++) *(float2 *)(po + (size_t)h * D) = make_float2(acc[h][0], acc[h][1]);
+}
+
+// o [B][1024] (fp16) = per head h: Wv[64h .. 64h + 63] . pooled[b][h], pooled = the sum of nch chunk partials
+// [B][nch][16][1024] fp32 taken in chunk order (k_phpool: T / PCH; calibration build: 1, from cuBLAS P Y). Value bias,
+// out-proj and their biases live in the folded tag head. One block (256 threads) per (image, head).
+extern "C" __global__ void k_phv(const float *__restrict__ pooled, const __half *__restrict__ wv, __half *__restrict__ o,
+                                 unsigned nch)
 {
     const float *pv;
-    float4 x[8], wf;
+    float4 x[8], wf, y;
     float a;
-    unsigned lane, wid, j, k, b, h, n;
+    unsigned lane, wid, j, k, b, h, n, c;
 
     b = blockIdx.x >> 4;
     h = blockIdx.x & 15;
     lane = threadIdx.x & 31;
     wid = threadIdx.x >> 5;
-    pv = pooled + (size_t)blockIdx.x * D;
-    for (j = 0; j < 8; j++) x[j] = ((const float4 *)pv)[lane + 32 * j];
+    pv = pooled + ((size_t)b * nch * 16 + h) * D;
+    for (j = 0; j < 8; j++) x[j] = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (c = 0; c < nch; c++)
+        for (j = 0; j < 8; j++) {
+            y = ((const float4 *)(pv + (size_t)c * 16 * D))[lane + 32 * j];
+            x[j].x += y.x; x[j].y += y.y; x[j].z += y.z; x[j].w += y.w;
+        }
     for (k = 0; k < 8; k++) { // 8 warps x 8 outputs
         n = 64 * h + 8 * wid + k;
         for (j = 0, a = 0.f; j < 8; j++) {
