@@ -34,19 +34,21 @@ Tested with CUDA 13.1, MinGW-w64 gcc 15.2 and CMake 4.2 on an RTX 500 Ada laptop
 
 ## Getting the models
 
-The model files in `src/models/` are stored with [Git LFS](https://git-lfs.com/). Install it before cloning:
+The weights are not in the repository. Download the ONNX models from Hugging Face and convert them once with the
+scripts in `src/tools/`; [GETTING_STARTED.md](GETTING_STARTED.md) has the exact commands.
 
-```
-git lfs install
-git clone https://github.com/holoarchivists/xtagger
-```
+- wd: [SmilingWolf/wd-eva02-large-tagger-v3](https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3)
+  (`model.onnx`, `selected_tags.csv`)
+- PixAI: [nocturna/pixai-tagger-v1.0-onnx](https://huggingface.co/nocturna/pixai-tagger-v1.0-onnx)
+  (`model.onnx`, `config.json`)
 
 | File | What it is |
 |---|---|
-| `src/models/eva02.bin`, `src/models/selected_tags.csv` | wd tagger weights (FP8) and its tag list |
-| `src/models/pixai.bin`, `src/models/pixai.bin.tags` | PixAI weights (FP8) and its tag list |
-| `src/models/calib/` | fp16 versions and calibration data. Needed to convert the models again (see below), and `eva02_fp16.bin` is the `-npu` input. |
-| `src/models/calib/eva02_fp16.bin.npu` | Compiled NPU graph (~770 MB), written by the first `-npu` run. Generated locally; do not commit it. |
+| `src/models/eva02.bin`, `src/models/selected_tags.csv` | wd tagger weights (FP8, converted) and its tag list (downloaded) |
+| `src/models/pixai.bin`, `src/models/pixai.bin.tags` | PixAI weights (FP8) and its tag list, both written by the converter |
+| `src/models/calib/*.calib` | Calibration ranges for the FP8 conversion. These are in the repository. |
+| `src/models/calib/eva02_fp16.bin` | fp16 wd weights, the `-npu` input. Generated locally (see Converting the models again). |
+| `src/models/calib/eva02_fp16.bin.npu` | Compiled NPU graph (~770 MB), written by the first `-npu` run. Generated locally. |
 
 ## Building
 
@@ -375,8 +377,9 @@ build\ortbench.exe px model_pixai.onnx <image folder>    (whole images, batch 1:
 
 ## Converting the models again
 
-This is only needed when updating to a new upstream model; the converted files are already in `src/models/`. It
-needs Python with `onnx` and `numpy`, the upstream ONNX files, and a build with `-DXTAG_CALIB=ON`. The FP8 scales
+This is only needed for a new upstream model, or for the fp16 file `-npu` uses; for the shipped models the
+calibration files are already in `src/models/calib/` (see [GETTING_STARTED.md](GETTING_STARTED.md)). It needs Python
+with `onnx`, `numpy` and `ml_dtypes`, the upstream ONNX files, and a build with `-DXTAG_CALIB=ON`. The FP8 scales
 come from running the fp16 model over a set of calibration images:
 
 ```
@@ -385,7 +388,8 @@ build\xtag_calib.exe src/models/calib/eva02_fp16.bin src/models/selected_tags.cs
 python src/tools/export_eva.py model.onnx src/models/eva02.bin src/models/calib/eva02_fp16.bin.calib
 ```
 
-PixAI works the same way with `src/tools/export_pixai.py`, which also takes `src/models/pixai/config_pixai.json`.
+PixAI works the same way with `src/tools/export_pixai.py`, which also takes PixAI's `config.json`. The first command
+alone writes `eva02_fp16.bin`, the `-npu` input.
 
 ## Repository layout
 
@@ -395,7 +399,7 @@ src/
   core/           image pipeline: compositing, xorvariance, xorcropping, resizing, route learner, scheduler
   engine/         CUDA engines and kernels for both models; NPU engine for wd (npu.h)
   tools/          kernel compiler (evacc), model converters, kernel and NPU test tools
-  models/         converted weights and tag lists (Git LFS)
+  models/         calibration ranges (calib/*.calib); converted weights and tag lists go here (not in git)
   third_party/    stb_image; Level Zero headers (Intel, MIT)
   docs/           design notes
 ```

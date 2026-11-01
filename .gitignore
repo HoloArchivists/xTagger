@@ -3,7 +3,9 @@
 # weights are converted locally (README: Converting the models), not shipped
 /src/models/*.bin
 /src/models/*.bin.tags
-/src/models/calib/
+/src/models/*.onnx
+/src/models/calib/*
+!/src/models/calib/*.calib
 /runs/
 /.vscode/
 /benchmarks.csv
